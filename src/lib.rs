@@ -1,6 +1,6 @@
 use std::fs;
 
-use crate::render::render_markdown;
+use crate::render::render_ast;
 
 pub mod render;
 
@@ -23,9 +23,7 @@ impl Config {
 pub fn run(config: Config) -> std::io::Result<String> {
     let contents = fs::read_to_string(config.file_path)?;
 
-    print!("{contents}");
-
-    render_markdown(&contents);
+    render_ast(&contents);
 
     Ok(contents)
 }
