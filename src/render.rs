@@ -142,7 +142,7 @@ pub fn render_markdown(md: &str) {
     print!("{html}");
 }
 
-pub fn render_ast(md: &str) {
+pub fn render_ast(md: &str) -> Vec<String> {
     let options = generate_options();
     let arena = Arena::new();
 
@@ -151,9 +151,7 @@ pub fn render_ast(md: &str) {
     let mut render = Render::new();
     render.block(root, "");
 
-    for line in render.lines {
-        println!("{line}");
-    }
+    render.lines
 }
 
 //fn walk<'a>(n: &'a AstNode<'a>, depth: usize) {
