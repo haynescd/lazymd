@@ -1,14 +1,24 @@
-use std::{error::Error, fs, io};
+use std::{error::Error, fs};
 
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
+use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{Terminal, backend::CrosstermBackend};
 
-use crate::{app::App, render::render_ast, tui::Tui, ui::ui};
+use crate::{
+    app::App,
+    event::{Event, EventHandler},
+    render::render_ast,
+    tui::Tui,
+    ui::ui,
+    watcher::MdWatcher,
+};
 
 pub mod app;
+pub mod event;
+pub mod logging;
 pub mod render;
 pub mod tui;
 pub mod ui;
+pub mod watcher;
 
 #[derive(Debug)]
 pub struct Config {
@@ -27,18 +37,36 @@ impl Config {
 }
 
 pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
-    let contents = fs::read_to_string(config.file_path)?;
-    let lines = render_ast(&contents);
-    let mut app = App::new(lines);
+    logging::init()?;
+    log::info!("codon starting for {}", config.file_path);
 
+    let file_path = config.file_path.clone();
+    let contents = fs::read_to_string(file_path.clone())?;
+    let lines = render_ast(&contents);
+
+    let mut app = App::new(file_path.clone(), lines);
+
+    let watcher = MdWatcher::new(file_path.clone());
     let backend = CrosstermBackend::new(std::io::stderr());
     let terminal = Terminal::new(backend)?;
-    let mut tui = Tui::new(terminal);
+    let events = EventHandler::new(250, watcher);
+    let mut tui = Tui::new(terminal, events);
     tui.enter()?;
     let result = (|| {
         while !app.should_quit {
             tui.draw(&mut app)?;
-            handle_events(&mut app)?;
+            match tui.events.next()? {
+                Event::Key(ke) => handle_key_event(ke, &mut app),
+                Event::Mouse(_) => {}
+                Event::Resize(_, _) => {}
+                Event::Tick => {}
+                Event::ReRender => {
+                    log::info!("reloading {}", app.md_filepath);
+                    let contents = fs::read_to_string(&app.md_filepath)?;
+                    let lines = render_ast(&contents);
+                    app.update(lines);
+                }
+            }
         }
         Ok(())
     })();
@@ -47,23 +75,11 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
     result
 }
 
-fn handle_events(app: &mut App) -> io::Result<()> {
-    match event::read()? {
-        // it's important to check that the event is a key press event as
-        // crossterm also emits key release and repeat events on Windows.
-        Event::Key(key_event) if key_event.kind == KeyEventKind::Press => {
-            handle_key_event(key_event, app);
-        }
-        _ => {}
-    };
-    Ok(())
-}
-
 fn handle_key_event(key_event: KeyEvent, app: &mut App) {
     match key_event.code {
-        KeyCode::Char('q') => app.quit(),
-        KeyCode::Char('j') => app.down(),
-        KeyCode::Char('k') => app.up(),
+        KeyCode::Esc | KeyCode::Char('q') => app.quit(),
+        KeyCode::Down | KeyCode::Char('j') => app.down(),
+        KeyCode::Up | KeyCode::Char('k') => app.up(),
         _ => {}
     }
 }

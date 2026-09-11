@@ -3,14 +3,16 @@ pub struct App {
     pub should_quit: bool,
     pub lines: Vec<String>,
     pub y_offset: u16,
+    pub md_filepath: String,
 }
 
 impl App {
-    pub fn new(lines: Vec<String>) -> Self {
+    pub fn new(md_filepath: String, lines: Vec<String>) -> Self {
         App {
             should_quit: false,
             lines,
             y_offset: 0,
+            md_filepath,
         }
     }
 
@@ -28,5 +30,9 @@ impl App {
 
     pub fn down(&mut self) {
         self.y_offset += 5;
+    }
+
+    pub fn update(&mut self, lines: Vec<String>) {
+        self.lines = lines
     }
 }
