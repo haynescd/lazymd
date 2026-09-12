@@ -50,20 +50,26 @@ impl EventHandler {
                     let timeout = tick_rate
                         .checked_sub(last_tick.elapsed())
                         .unwrap_or(tick_rate);
+                    // A failed send means the receiver is gone — the app is
+                    // shutting down — so this thread's work is done.
                     if event::poll(timeout).expect("unable to poll for event") {
-                        match event::read().expect("unable to read event") {
+                        let sent = match event::read().expect("unable to read event") {
                             CrosstermEvent::Key(e) if e.kind == event::KeyEventKind::Press => {
                                 sender.send(Event::Key(e))
                             }
-                            CrosstermEvent::Key(_) => Ok(()),
                             CrosstermEvent::Mouse(e) => sender.send(Event::Mouse(e)),
                             CrosstermEvent::Resize(w, h) => sender.send(Event::Resize(w, h)),
-                            _ => unimplemented!(),
+                            // Key releases/repeats, focus changes, pastes: not used.
+                            _ => Ok(()),
+                        };
+                        if sent.is_err() {
+                            return;
                         }
-                        .expect("failed to send terminal event")
                     }
                     if last_tick.elapsed() >= tick_rate {
-                        sender.send(Event::Tick).expect("failed to send tick event");
+                        if sender.send(Event::Tick).is_err() {
+                            return;
+                        }
 
                         // Drain every pending fs-change signal so a burst of events from one
                         // save (write + rename, etc.) collapses into a single re-render.
@@ -71,10 +77,8 @@ impl EventHandler {
                         while watcher.watch_rx.try_recv().is_ok() {
                             changed = true;
                         }
-                        if changed {
-                            sender
-                                .send(Event::ReRender)
-                                .expect("failed to send rerender event");
+                        if changed && sender.send(Event::ReRender).is_err() {
+                            return;
                         }
                         last_tick = Instant::now();
                     }
