@@ -5,10 +5,9 @@ use simplelog::{Config, WriteLogger};
 
 /// Sets up file-based logging for the TUI.
 ///
-/// The TUI owns the whole terminal, so `println!`/`eprintln!` calls get
-/// overwritten by the next redraw before you can ever see them. Everything
-/// goes to a file instead: `~/.codon/logs/codon.log`. Once this is called,
-/// `log::debug!`, `log::info!`, etc. work from anywhere in the crate.
+/// The TUI owns the terminal, so `println!` output is overwritten by the next
+/// redraw before anyone sees it. Everything goes to `~/.codon/logs/codon.log`
+/// instead, and `log::info!` and friends work crate-wide once this has run.
 pub fn init() -> anyhow::Result<()> {
     let log_dir = log_dir();
     fs::create_dir_all(&log_dir)?;

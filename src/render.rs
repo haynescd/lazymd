@@ -1,14 +1,19 @@
 //! Turns Markdown into styled terminal lines.
 //!
-//! The AST walk is split the same way it always was: `block` handles the
-//! vertical structure (paragraphs, lists, quotes, ...) and `inline` flattens a
-//! block's contents into styled `Span`s. What's new is that output is built
-//! from ratatui's rich-text types — a `Line` is a row of `Span`s, and each
-//! `Span` carries its own `Style` — so a word can be bold without any `**`.
+//! `block` handles vertical structure (paragraphs, lists, quotes, ...) and
+//! `inline` flattens a block's contents into styled `Span`s. A `Line` is a row
+//! of `Span`s and each carries its own `Style`, so a word can be bold without
+//! any `**`.
 //!
-//! Rendering happens at a fixed width, because wrapping has to happen here
-//! (see `wrap.rs`) and rules and code blocks stretch to fill the line. The app
+//! Rendering happens at a fixed width, because wrapping happens here (see
+//! `wrap.rs`) and rules and code blocks stretch to fill the line. The app
 //! re-renders whenever the terminal is resized.
+//!
+//! State splits three ways: `Canvas` owns the output and how a line is placed,
+//! `Ctx` is what a block inherits from the containers around it, and `Render`
+//! holds both plus what's global to the whole document.
+
+use std::sync::LazyLock;
 
 use comrak::{
     Arena, Options,
@@ -23,84 +28,150 @@ use ratatui::{
 
 use crate::{highlight, theme, wrap};
 
+mod inline;
+mod table;
+
 /// Narrowest width we'll wrap text to. If nesting eats more of the screen than
 /// this, lines overflow and get clipped rather than collapsing to a letter per row.
 const MIN_TEXT_WIDTH: usize = 10;
-/// Narrowest a table column may be squeezed to.
-const MIN_COLUMN_WIDTH: usize = 3;
+/// The footnote section's divider is short, not a full-width rule.
+const FOOTNOTE_RULE_WIDTH: usize = 20;
+/// Columns a code block spends on padding: one space either side of the code.
+const CODE_GUTTER: usize = 2;
 
-/// Text drawn at the start of every line inside one enclosing container: a
-/// blockquote's bar, a list item's marker. `first` goes on the container's
-/// first line and `rest` on every line after. Both have the same width, so the
-/// text they lead into stays aligned.
+/// Text drawn at the start of every line inside one container: a blockquote's
+/// bar, a list item's marker. `first` leads the container's first line, `rest`
+/// every line after. The constructors keep the two the same width, which is
+/// what keeps the text they lead into aligned.
 #[derive(Debug)]
 struct Prefix {
     first: Vec<Span<'static>>,
     rest: Vec<Span<'static>>,
+    /// What this prefix costs on every line, whichever variant gets drawn.
+    width: usize,
     used: bool,
 }
 
 impl Prefix {
-    /// The same on every line, like a blockquote's bar.
-    fn constant(spans: Vec<Span<'static>>) -> Self {
+    fn new(first: Vec<Span<'static>>, rest: Vec<Span<'static>>) -> Self {
+        let width = wrap::width(&first);
+        debug_assert_eq!(width, wrap::width(&rest), "prefix variants must align");
         Prefix {
-            first: spans.clone(),
-            rest: spans,
+            first,
+            rest,
+            width,
             used: false,
         }
+    }
+
+    /// The same on every line, like a blockquote's bar.
+    fn constant(spans: Vec<Span<'static>>) -> Self {
+        Self::new(spans.clone(), spans)
     }
 
     /// Shown once, then replaced by blanks of the same width, like a bullet.
     fn marker(spans: Vec<Span<'static>>) -> Self {
-        let width = wrap::width(&spans);
-        Prefix {
-            first: spans,
-            rest: vec![Span::raw(" ".repeat(width))],
-            used: false,
+        let rest = vec![Span::raw(" ".repeat(wrap::width(&spans)))];
+        Self::new(spans, rest)
+    }
+
+    /// The spans for the next line: the marker the first time, blanks after.
+    fn take(&mut self) -> &[Span<'static>] {
+        if std::mem::replace(&mut self.used, true) {
+            &self.rest
+        } else {
+            &self.first
         }
     }
 }
 
+/// Everything an item's marker needs that is fixed for the whole list.
 #[derive(Debug)]
-struct Render {
+struct Markers {
+    list_type: ListType,
+    start: usize,
+    /// Width of the widest number, so `9.` and `10.` align their text.
+    num_width: usize,
+    delim: char,
+    depth: usize,
+}
+
+impl Markers {
+    fn new(nl: NodeList, count: usize, depth: usize) -> Self {
+        let last = nl.start + count.saturating_sub(1);
+        Markers {
+            list_type: nl.list_type,
+            start: nl.start,
+            num_width: last.to_string().len(),
+            delim: match nl.delimiter {
+                ListDelimType::Period => '.',
+                ListDelimType::Paren => ')',
+            },
+            depth,
+        }
+    }
+
+    /// The marker for item `i`.
+    fn at(&self, i: usize, checked: Option<bool>) -> Vec<Span<'static>> {
+        let (num_width, delim) = (self.num_width, self.delim);
+        let mut spans = Vec::new();
+        match self.list_type {
+            ListType::Ordered => spans.push(Span::styled(
+                format!("{:>num_width$}{delim} ", self.start + i),
+                theme::ordered_marker(),
+            )),
+            // A checkbox replaces the bullet rather than sitting beside it.
+            ListType::Bullet if checked.is_none() => {
+                let (glyph, style) = theme::bullet(self.depth);
+                spans.push(Span::styled(format!("{glyph} "), style));
+            }
+            ListType::Bullet => {}
+        }
+        match checked {
+            Some(true) => spans.push(Span::styled("✔ ", theme::task_done())),
+            Some(false) => spans.push(Span::styled("☐ ", theme::task_todo())),
+            None => {}
+        }
+        spans
+    }
+}
+
+/// What stands between the last line emitted and the next block: one question
+/// with three answers, rather than flags that could contradict each other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Gap {
+    /// Nothing emitted yet, or a container just opened.
+    Open,
+    /// A blank line is already there.
+    Blank,
+    /// Content; the next block needs a separator.
+    Content,
+}
+
+/// The rendered document, and everything needed to place one more line in it.
+#[derive(Debug)]
+struct Canvas {
     /// Total width available, in columns.
     width: usize,
     lines: Vec<Line<'static>>,
     /// One entry per container we're currently inside, outermost first.
     prefixes: Vec<Prefix>,
-    /// Style every piece of text starts from — a blockquote greys it out, a
-    /// checked task dims it.
-    base: Style,
-    /// Inside a tight list, blocks aren't separated by blank lines.
-    tight: bool,
-    list_depth: usize,
-    last_blank: bool,
-    /// A container just opened, so its first block starts right away rather
-    /// than after a blank line.
-    fresh: bool,
-    footnotes_started: bool,
+    gap: Gap,
 }
 
-impl Render {
-    pub fn new(width: usize) -> Self {
-        Render {
+impl Canvas {
+    fn new(width: usize) -> Self {
+        Canvas {
             width,
             lines: Vec::new(),
             prefixes: Vec::new(),
-            base: Style::default(),
-            tight: false,
-            list_depth: 0,
-            last_blank: false,
-            fresh: false,
-            footnotes_started: false,
+            gap: Gap::Open,
         }
     }
 
-    // --- line output -------------------------------------------------------
-
     /// Width left for content once every active prefix has taken its share.
     fn avail(&self) -> usize {
-        let used: usize = self.prefixes.iter().map(|p| wrap::width(&p.rest)).sum();
+        let used: usize = self.prefixes.iter().map(|p| p.width).sum();
         self.width.saturating_sub(used).max(MIN_TEXT_WIDTH)
     }
 
@@ -108,17 +179,11 @@ impl Render {
     fn push_line(&mut self, content: Vec<Span<'static>>) {
         let mut spans = Vec::new();
         for p in &mut self.prefixes {
-            if p.used {
-                spans.extend(p.rest.iter().cloned());
-            } else {
-                spans.extend(p.first.iter().cloned());
-                p.used = true;
-            }
+            spans.extend(p.take().iter().cloned());
         }
         spans.extend(content);
         self.lines.push(Line::from(spans));
-        self.last_blank = false;
-        self.fresh = false;
+        self.gap = Gap::Content;
     }
 
     /// Emits a blank separator line. It keeps visible prefixes (a quote's bar
@@ -130,15 +195,7 @@ impl Render {
             .flat_map(|p| p.rest.iter().cloned())
             .collect();
         self.lines.push(Line::from(spans));
-        self.last_blank = true;
-    }
-
-    /// Called at the start of each block: leaves one blank line between it and
-    /// whatever came before, unless that would be wrong here.
-    fn separate(&mut self) {
-        if !self.lines.is_empty() && !self.last_blank && !self.tight && !self.fresh {
-            self.blank();
-        }
+        self.gap = Gap::Blank;
     }
 
     /// Word-wraps `spans` to the available width and emits the result.
@@ -148,21 +205,80 @@ impl Render {
         }
     }
 
-    /// Runs `f` inside a container that contributes `prefix` to each line.
-    fn nested(&mut self, prefix: Prefix, f: impl FnOnce(&mut Self)) {
-        self.prefixes.push(prefix);
-        self.fresh = true;
-        f(self);
-        // A container with no content (an empty list item) still shows its marker.
-        if !self.prefixes.last().is_some_and(|p| p.used) {
-            self.push_line(Vec::new());
+    /// Emits a horizontal rule `width` columns wide.
+    fn rule(&mut self, glyph: &str, width: usize, style: Style) {
+        self.push_line(vec![Span::styled(glyph.repeat(width), style)]);
+    }
+}
+
+/// What a block inherits from the containers around it. `Render::scoped` and
+/// `Render::nested` save and restore it.
+///
+/// Prose inherits `base`; chrome doesn't. Borders, markers, rules and cell
+/// padding are themed absolutely, so a table inside a blockquote keeps its own
+/// border color.
+#[derive(Debug, Clone, Copy, Default)]
+struct Ctx {
+    /// Style every piece of text starts from — a blockquote greys it out, a
+    /// checked task dims it.
+    base: Style,
+    /// Inside a tight list, blocks aren't separated by blank lines.
+    tight: bool,
+    list_depth: usize,
+}
+
+#[derive(Debug)]
+struct Render {
+    out: Canvas,
+    ctx: Ctx,
+    /// Footnote definitions share one divider, drawn before the first of them.
+    footnotes_started: bool,
+}
+
+impl Render {
+    fn new(width: usize) -> Self {
+        Render {
+            out: Canvas::new(width),
+            ctx: Ctx::default(),
+            footnotes_started: false,
         }
-        self.prefixes.pop();
+    }
+
+    // --- structure ---------------------------------------------------------
+
+    /// Called at the start of each block: leaves one blank line between it and
+    /// whatever came before, unless that would be wrong here.
+    fn separate(&mut self) {
+        if self.out.gap == Gap::Content && !self.ctx.tight {
+            self.out.blank();
+        }
+    }
+
+    /// Runs `f` with `ctx` in force, then puts the caller's context back.
+    fn scoped(&mut self, ctx: Ctx, f: impl FnOnce(&mut Self)) {
+        let saved = std::mem::replace(&mut self.ctx, ctx);
+        f(self);
+        self.ctx = saved;
+    }
+
+    /// Runs `f` inside a container that leads every line with `prefix` and
+    /// renders under `ctx`. Both are unwound when it closes.
+    fn nested(&mut self, prefix: Prefix, ctx: Ctx, f: impl FnOnce(&mut Self)) {
+        self.out.prefixes.push(prefix);
+        self.out.gap = Gap::Open;
+        self.scoped(ctx, f);
+        // A container with no content (an empty list item) still shows its marker.
+        if !self.out.prefixes.last().is_some_and(|p| p.used) {
+            self.out.push_line(Vec::new());
+        }
+        self.out.prefixes.pop();
+        // It drew at least its own marker, so the next block needs a separator.
+        self.out.gap = Gap::Content;
     }
 
     // --- blocks ------------------------------------------------------------
 
-    fn children<'a>(&mut self, n: &'a AstNode<'a>) {
+    fn blocks<'a>(&mut self, n: &'a AstNode<'a>) {
         for child in n.children() {
             self.block(child);
         }
@@ -172,24 +288,20 @@ impl Render {
         let data = n.data.borrow();
 
         match &data.value {
-            NodeValue::Document => self.children(n),
+            NodeValue::Document => self.blocks(n),
             NodeValue::Heading(h) => self.heading(n, h.level),
             NodeValue::Paragraph => {
                 self.separate();
-                let spans = self.inlines(n, self.base);
-                self.wrapped(spans);
+                let spans = inline::inlines(n, self.ctx.base);
+                self.out.wrapped(spans);
             }
             NodeValue::List(nl) => self.list(n, *nl),
             // Items are handled by `list`; these only appear if one is orphaned.
-            NodeValue::Item(_) | NodeValue::TaskItem(_) => self.children(n),
+            NodeValue::Item(_) | NodeValue::TaskItem(_) => self.blocks(n),
             NodeValue::CodeBlock(cb) => self.code_block(&cb.info, &cb.literal),
             NodeValue::HtmlBlock(hb) => self.literal_block(&hb.literal),
             NodeValue::FrontMatter(fm) => self.literal_block(fm),
-            NodeValue::ThematicBreak => {
-                self.separate();
-                let rule = "─".repeat(self.avail());
-                self.push_line(vec![Span::styled(rule, theme::rule())]);
-            }
+            NodeValue::ThematicBreak => self.thematic_break(),
             NodeValue::BlockQuote | NodeValue::MultilineBlockQuote(_) => {
                 let bar = Span::styled("▎ ", theme::quote_bar());
                 self.quote(n, bar, theme::quote_text(), None);
@@ -204,26 +316,28 @@ impl Render {
                 self.quote(n, Span::styled("▎ ", style), Style::default(), Some(title));
             }
             NodeValue::Table(table) => self.table(n, &table.alignments),
-            NodeValue::FootnoteDefinition(def) => {
-                if !self.footnotes_started {
-                    self.footnotes_started = true;
-                    self.separate();
-                    let rule = "─".repeat(self.avail().min(20));
-                    self.push_line(vec![Span::styled(rule, theme::rule())]);
-                }
-                self.separate();
-                let label = Span::styled(format!("[{}] ", def.name), theme::footnote());
-                self.nested(Prefix::marker(vec![label]), |r| r.children(n));
-            }
-            _ => self.children(n),
+            NodeValue::FootnoteDefinition(def) => self.footnote_definition(n, &def.name),
+            _ => self.blocks(n),
+        }
+    }
+
+    fn table<'a>(&mut self, n: &'a AstNode<'a>, alignments: &[TableAlignment]) {
+        // Laid out before separating, so an empty table leaves no stray blank line.
+        let avail = self.out.avail();
+        let Some(rows) = table::render(n, self.ctx.base, avail, alignments) else {
+            return;
         };
+        self.separate();
+        for row in rows {
+            self.out.push_line(row);
+        }
     }
 
     fn heading<'a>(&mut self, n: &'a AstNode<'a>, level: u8) {
         self.separate();
-        let style = self.base.patch(theme::heading(level));
-        let spans = self.inlines(n, style);
-        self.wrapped(spans);
+        let style = self.ctx.base.patch(theme::heading(level));
+        let spans = inline::inlines(n, style);
+        self.out.wrapped(spans);
 
         // Like GitHub, the top two levels get a rule underneath.
         let underline = match level {
@@ -231,62 +345,42 @@ impl Render {
             2 => "─",
             _ => return,
         };
-        let rule = underline.repeat(self.avail());
-        self.push_line(vec![Span::styled(rule, theme::heading_rule(level))]);
+        self.out
+            .rule(underline, self.out.avail(), theme::heading_rule(level));
+    }
+
+    fn thematic_break(&mut self) {
+        self.separate();
+        self.out.rule("─", self.out.avail(), theme::rule());
     }
 
     fn list<'a>(&mut self, n: &'a AstNode<'a>, nl: NodeList) {
         self.separate();
-        let saved_tight = std::mem::replace(&mut self.tight, nl.tight);
-        let depth = self.list_depth;
-        self.list_depth += 1;
 
-        // Right-align numbers so `9.` and `10.` put their text in the same column.
-        let last = nl.start + n.children().count().saturating_sub(1);
-        let num_width = last.to_string().len();
-        let delim = match nl.delimiter {
-            ListDelimType::Period => '.',
-            ListDelimType::Paren => ')',
-        };
+        let markers = Markers::new(nl, n.children().count(), self.ctx.list_depth);
+        let mut ctx = self.ctx;
+        ctx.tight = nl.tight;
+        ctx.list_depth += 1;
 
-        for (i, item) in n.children().enumerate() {
-            if i > 0 {
-                self.separate(); // a no-op in tight lists
-            }
-            let checked = match item.data.borrow().value {
-                NodeValue::TaskItem(t) => Some(t.symbol.is_some()),
-                _ => None,
-            };
-
-            let mut marker = Vec::new();
-            match nl.list_type {
-                ListType::Ordered => marker.push(Span::styled(
-                    format!("{:>num_width$}{delim} ", nl.start + i),
-                    theme::ordered_marker(),
-                )),
-                // A checkbox replaces the bullet rather than sitting beside it.
-                ListType::Bullet if checked.is_none() => {
-                    let (glyph, style) = theme::bullet(depth);
-                    marker.push(Span::styled(format!("{glyph} "), style));
+        self.scoped(ctx, |r| {
+            for (i, item) in n.children().enumerate() {
+                if i > 0 {
+                    r.separate(); // a no-op in tight lists
                 }
-                ListType::Bullet => {}
-            }
-            match checked {
-                Some(true) => marker.push(Span::styled("✔ ", theme::task_done())),
-                Some(false) => marker.push(Span::styled("☐ ", theme::task_todo())),
-                None => {}
-            }
+                let checked = match item.data.borrow().value {
+                    NodeValue::TaskItem(t) => Some(t.symbol.is_some()),
+                    _ => None,
+                };
 
-            let saved_base = self.base;
-            if checked == Some(true) {
-                self.base = self.base.patch(theme::task_done_text());
+                let mut item_ctx = r.ctx;
+                if checked == Some(true) {
+                    item_ctx.base = item_ctx.base.patch(theme::task_done_text());
+                }
+                r.nested(Prefix::marker(markers.at(i, checked)), item_ctx, |r| {
+                    r.blocks(item)
+                });
             }
-            self.nested(Prefix::marker(marker), |r| r.children(item));
-            self.base = saved_base;
-        }
-
-        self.list_depth = depth;
-        self.tight = saved_tight;
+        });
     }
 
     /// A blockquote or alert: a colored bar down the left, an optional title.
@@ -298,29 +392,37 @@ impl Render {
         title: Option<Span<'static>>,
     ) {
         self.separate();
-        let saved_base = self.base;
-        let saved_tight = std::mem::replace(&mut self.tight, false);
-        self.base = self.base.patch(text);
+        let mut ctx = self.ctx;
+        ctx.tight = false;
+        ctx.base = ctx.base.patch(text);
 
-        self.nested(Prefix::constant(vec![bar]), |r| {
+        self.nested(Prefix::constant(vec![bar]), ctx, |r| {
             if let Some(title) = title {
-                r.push_line(vec![title]);
-                r.fresh = true; // no gap between an alert's title and its body
+                r.out.push_line(vec![title]);
+                r.out.gap = Gap::Open; // no gap between an alert's title and its body
             }
-            r.children(n);
+            r.blocks(n);
         });
+    }
 
-        self.base = saved_base;
-        self.tight = saved_tight;
+    fn footnote_definition<'a>(&mut self, n: &'a AstNode<'a>, name: &str) {
+        if !self.footnotes_started {
+            self.footnotes_started = true;
+            self.separate();
+            let width = self.out.avail().min(FOOTNOTE_RULE_WIDTH);
+            self.out.rule("─", width, theme::rule());
+        }
+        self.separate();
+        let label = Span::styled(format!("[{name}] "), theme::footnote());
+        let ctx = self.ctx;
+        self.nested(Prefix::marker(vec![label]), ctx, |r| r.blocks(n));
     }
 
     fn code_block(&mut self, info: &str, literal: &str) {
         self.separate();
-        let lang = info
-            .split(|c: char| c.is_whitespace() || c == ',' || c == '{')
-            .next()
-            .unwrap_or("");
-        let literal = literal.replace('\t', "    ");
+        let lang = fence_language(info);
+        // syntect reads indentation itself, so tabs are expanded before it sees them.
+        let literal = wrap::expand_tabs(literal);
         let bg = theme::code_block();
 
         let code: Vec<Vec<Span<'static>>> = match highlight::highlight(&literal, lang) {
@@ -328,7 +430,7 @@ impl Render {
                 .into_iter()
                 .map(|l| {
                     l.into_iter()
-                        .map(|s| s.patch_style(Style::new().bg(theme::CODE_BG)))
+                        .map(|s| s.patch_style(theme::code_bg()))
                         .collect()
                 })
                 .collect(),
@@ -338,27 +440,29 @@ impl Render {
                 .collect(),
         };
 
-        // Every row is padded to the full width, which is what turns a set of
-        // lines into a solid block of background color.
-        let width = self.avail();
-        let label = if lang.is_empty() {
-            String::new()
-        } else {
-            format!("{lang} ")
+        // Padding every row to the full width is what makes the background solid.
+        let width = self.out.avail();
+
+        // Right-aligned on the first line, and dropped rather than allowed to
+        // push that one row wider than the rest.
+        let label =
+            (!lang.is_empty()).then(|| Span::styled(format!("{lang} "), theme::code_label()));
+        let header = match label {
+            Some(l) if l.width() <= width => {
+                vec![Span::styled(" ".repeat(width - l.width()), bg), l]
+            }
+            _ => Vec::new(),
         };
-        let label = Span::styled(label, theme::code_label());
-        self.push_line(vec![
-            Span::styled(" ".repeat(width.saturating_sub(label.width())), bg),
-            label,
-        ]);
+        self.out.push_line(wrap::pad(header, width, bg));
+
         for line in code {
-            for chunk in wrap::wrap_chars(&line, width.saturating_sub(2)) {
+            for chunk in wrap::wrap_anywhere(&line, width.saturating_sub(CODE_GUTTER)) {
                 let mut row = vec![Span::styled(" ", bg)];
                 row.extend(chunk);
-                self.push_line(wrap::pad(row, width, bg));
+                self.out.push_line(wrap::pad(row, width, bg));
             }
         }
-        self.push_line(wrap::pad(Vec::new(), width, bg));
+        self.out.push_line(wrap::pad(Vec::new(), width, bg));
     }
 
     /// Raw HTML or front matter: shown dimmed and verbatim. HTML comments are
@@ -369,234 +473,49 @@ impl Render {
             return;
         }
         self.separate();
-        let width = self.avail();
+        let width = self.out.avail();
         for line in literal.trim_end().lines() {
-            let span = Span::styled(line.to_string(), self.base.patch(theme::html()));
-            for chunk in wrap::wrap_chars(&[span], width) {
-                self.push_line(chunk);
+            let span = Span::styled(line.to_string(), self.ctx.base.patch(theme::html()));
+            for chunk in wrap::wrap_anywhere(&[span], width) {
+                self.out.push_line(chunk);
             }
-        }
-    }
-
-    fn table<'a>(&mut self, n: &'a AstNode<'a>, alignments: &[TableAlignment]) {
-        self.separate();
-
-        // Pass 1: render every cell, since column widths depend on all rows.
-        let mut rows: Vec<(bool, Vec<Vec<Span<'static>>>)> = Vec::new();
-        for row in n.children() {
-            let header = matches!(row.data.borrow().value, NodeValue::TableRow(true));
-            let style = if header {
-                self.base.patch(theme::table_header())
-            } else {
-                self.base
-            };
-            let cells = row
-                .children()
-                .map(|cell| self.inlines(cell, style))
-                .collect();
-            rows.push((header, cells));
-        }
-        let columns = rows.iter().map(|(_, cells)| cells.len()).max().unwrap_or(0);
-        if columns == 0 {
-            return;
-        }
-
-        let mut widths = vec![1; columns];
-        for (_, cells) in &rows {
-            for (w, cell) in widths.iter_mut().zip(cells) {
-                *w = (*w).max(wrap::max_line_width(cell));
-            }
-        }
-        // Each column costs its width plus `│ ` and a trailing space; one more
-        // `│` closes the row.
-        fit_columns(&mut widths, self.avail().saturating_sub(3 * columns + 1));
-
-        // Pass 2: wrap each cell to its column and lay out the grid.
-        let grid: Vec<(bool, Vec<Vec<Vec<Span<'static>>>>)> = rows
-            .into_iter()
-            .map(|(header, cells)| {
-                let wrapped = (0..columns)
-                    .map(|i| match cells.get(i) {
-                        Some(cell) => wrap::wrap(cell, widths[i]),
-                        None => vec![Vec::new()],
-                    })
-                    .collect();
-                (header, wrapped)
-            })
-            .collect();
-        // Once a cell spans several lines, rules between rows keep them readable.
-        let multiline = grid
-            .iter()
-            .any(|(_, cells)| cells.iter().any(|c| c.len() > 1));
-
-        let border = theme::table_border();
-        let rule = |left: &str, mid: &str, right: &str| {
-            let segments: Vec<String> = widths.iter().map(|w| "─".repeat(w + 2)).collect();
-            vec![Span::styled(
-                format!("{left}{}{right}", segments.join(mid)),
-                border,
-            )]
-        };
-
-        self.push_line(rule("┌", "┬", "┐"));
-        for (r, (_, cells)) in grid.iter().enumerate() {
-            if r > 0 && (grid[r - 1].0 || multiline) {
-                self.push_line(rule("├", "┼", "┤"));
-            }
-            let height = cells.iter().map(Vec::len).max().unwrap_or(1);
-            for k in 0..height {
-                let mut line = vec![Span::styled("│", border)];
-                for (i, cell) in cells.iter().enumerate() {
-                    let content = cell.get(k).cloned().unwrap_or_default();
-                    let align = alignments.get(i).copied().unwrap_or(TableAlignment::None);
-                    line.push(Span::raw(" "));
-                    line.extend(align_cell(content, widths[i], align));
-                    line.push(Span::raw(" "));
-                    line.push(Span::styled("│", border));
-                }
-                self.push_line(line);
-            }
-        }
-        self.push_line(rule("└", "┴", "┘"));
-    }
-
-    // --- inlines -----------------------------------------------------------
-
-    /// Renders all of `n`'s inline children, starting from `style`.
-    fn inlines<'a>(&self, n: &'a AstNode<'a>, style: Style) -> Vec<Span<'static>> {
-        let mut out = Vec::new();
-        self.inline_children(n, style, &mut out);
-        out
-    }
-
-    fn inline_children<'a>(&self, n: &'a AstNode<'a>, style: Style, out: &mut Vec<Span<'static>>) {
-        for child in n.children() {
-            self.inline(child, style, out);
-        }
-    }
-
-    /// Styles nest by patching: `**[a link](x)**` renders the link's text with
-    /// the link style layered over bold.
-    fn inline<'a>(&self, n: &'a AstNode<'a>, style: Style, out: &mut Vec<Span<'static>>) {
-        let data = n.data.borrow();
-        match &data.value {
-            NodeValue::Text(t) => out.push(Span::styled(t.to_string(), style)),
-            NodeValue::SoftBreak => out.push(Span::styled(" ", style)),
-            NodeValue::LineBreak => out.push(Span::styled("\n", style)),
-            NodeValue::Strong => self.inline_children(n, style.add_modifier(Modifier::BOLD), out),
-            NodeValue::Emph => self.inline_children(n, style.add_modifier(Modifier::ITALIC), out),
-            NodeValue::Strikethrough => {
-                self.inline_children(n, style.add_modifier(Modifier::CROSSED_OUT), out)
-            }
-            NodeValue::Underline => {
-                self.inline_children(n, style.add_modifier(Modifier::UNDERLINED), out)
-            }
-            NodeValue::Code(c) => out.push(Span::styled(
-                c.literal.clone(),
-                style.patch(theme::inline_code()),
-            )),
-            NodeValue::Math(m) => out.push(Span::styled(
-                m.literal.clone(),
-                style.patch(theme::inline_code()),
-            )),
-            NodeValue::Link(_) | NodeValue::WikiLink(_) => {
-                self.inline_children(n, style.patch(theme::link()), out)
-            }
-            NodeValue::Image(_) => {
-                let alt: String = self
-                    .inlines(n, style)
-                    .iter()
-                    .map(|s| s.content.as_ref())
-                    .collect();
-                let label = if alt.is_empty() {
-                    "[image]".to_string()
-                } else {
-                    format!("[image: {alt}]")
-                };
-                out.push(Span::styled(label, style.patch(theme::image())));
-            }
-            NodeValue::HtmlInline(html) => {
-                let tag = html.trim().to_ascii_lowercase();
-                if matches!(tag.as_str(), "<br>" | "<br/>" | "<br />") {
-                    out.push(Span::styled("\n", style));
-                } else if !tag.starts_with("<!--") {
-                    out.push(Span::styled(html.clone(), style.patch(theme::html())));
-                }
-            }
-            NodeValue::FootnoteReference(r) => out.push(Span::styled(
-                format!("[{}]", r.name),
-                style.patch(theme::footnote()),
-            )),
-            _ => self.inline_children(n, style, out),
         }
     }
 }
 
-/// Shrinks the widest columns, one column at a time, until the total fits in
-/// `budget`. Stops early if every column is already at the minimum — the
-/// table then overflows instead of becoming unreadable.
-fn fit_columns(widths: &mut [usize], budget: usize) {
-    while widths.iter().sum::<usize>() > budget {
-        let Some(widest) = widths.iter_mut().max() else {
-            return;
-        };
-        if *widest <= MIN_COLUMN_WIDTH {
-            return;
-        }
-        *widest -= 1;
-    }
+/// The language from a fence's info string, which may carry more after it:
+/// `rust`, `python title="x"`, `js,twoslash`, `{r}`.
+fn fence_language(info: &str) -> &str {
+    let end = info
+        .find(|c: char| c.is_whitespace() || c == ',' || c == '{')
+        .unwrap_or(info.len());
+    &info[..end]
 }
 
-/// Pads a cell's content out to `width` according to the column's alignment.
-fn align_cell(
-    content: Vec<Span<'static>>,
-    width: usize,
-    align: TableAlignment,
-) -> Vec<Span<'static>> {
-    let slack = width.saturating_sub(wrap::width(&content));
-    let (left, right) = match align {
-        TableAlignment::Right => (slack, 0),
-        TableAlignment::Center => (slack / 2, slack - slack / 2),
-        TableAlignment::Left | TableAlignment::None => (0, slack),
-    };
-    let mut out = Vec::with_capacity(content.len() + 2);
-    if left > 0 {
-        out.push(Span::raw(" ".repeat(left)));
-    }
-    out.extend(content);
-    if right > 0 {
-        out.push(Span::raw(" ".repeat(right)));
-    }
-    out
-}
-
-fn generate_options() -> Options<'static> {
-    Options {
-        extension: Extension {
-            table: true,
-            strikethrough: true,
-            tasklist: true,
-            autolink: true,
-            footnotes: true,
-            alerts: true,
-            front_matter_delimiter: Some("---".to_string()),
-            ..Default::default()
-        },
+/// Built once; `render_ast` runs on every resize.
+static OPTIONS: LazyLock<Options<'static>> = LazyLock::new(|| Options {
+    extension: Extension {
+        table: true,
+        strikethrough: true,
+        tasklist: true,
+        autolink: true,
+        footnotes: true,
+        alerts: true,
+        front_matter_delimiter: Some("---".to_string()),
         ..Default::default()
-    }
-}
+    },
+    ..Default::default()
+});
 
 /// Parses `md` and renders it to lines that fit in `width` columns.
 pub fn render_ast(md: &str, width: usize) -> Vec<Line<'static>> {
-    let options = generate_options();
     let arena = Arena::new();
-
-    let root = parse_document(&arena, md, &options);
+    let root = parse_document(&arena, md, &OPTIONS);
 
     let mut render = Render::new(width);
     render.block(root);
 
-    render.lines
+    render.out.lines
 }
 
 #[cfg(test)]
@@ -747,6 +666,21 @@ mod tests {
         assert_eq!(span_with(&lines, "todo").style.fg, None);
     }
 
+    /// A checked item dims only its own text — the next item starts clean.
+    #[test]
+    fn task_dimming_does_not_leak_to_the_next_item() {
+        let lines = render_ast("- [x] done\n- plain", 40);
+        assert_eq!(span_with(&lines, "plain").style.fg, None);
+    }
+
+    /// A quote's grey and its looseness end with the quote.
+    #[test]
+    fn quote_styling_does_not_leak_to_the_next_block() {
+        let lines = render_ast("- > quoted\n- plain", 40);
+        assert_eq!(span_with(&lines, "plain").style.fg, None);
+        assert_eq!(plain(&lines), ["• ▎ quoted", "• plain"]);
+    }
+
     #[test]
     fn blockquote_bar_continues_across_paragraphs_and_wraps() {
         let out = plain(&render_ast("> aaa bbb ccc\n>\n> ddd", 11));
@@ -795,6 +729,24 @@ mod tests {
         assert_eq!(out, ["", " plain text", ""]);
     }
 
+    /// A label too wide for the block is dropped rather than widening one row.
+    #[test]
+    fn code_block_label_never_widens_the_block() {
+        let lines = render_ast("```averyveryverylonglanguagename\nx\n```", 12);
+        for line in &lines {
+            assert_eq!(line.width(), 12, "{:?}", plain(&lines));
+        }
+        assert_eq!(plain(&lines)[0], "");
+    }
+
+    #[test]
+    fn fence_info_string_yields_just_the_language() {
+        assert_eq!(fence_language("rust"), "rust");
+        assert_eq!(fence_language("python title=\"x\""), "python");
+        assert_eq!(fence_language("js,twoslash"), "js");
+        assert_eq!(fence_language(""), "");
+    }
+
     #[test]
     fn thematic_break_spans_the_width() {
         assert_eq!(render("a\n\n---\n\nb"), ["a", "", &"─".repeat(40), "", "b"]);
@@ -837,6 +789,18 @@ mod tests {
         }
         let out = plain(&lines);
         assert!(out.len() > 5, "the long cell should wrap: {out:?}");
+    }
+
+    /// Columns are measured the same way the finished line is, so borders line up.
+    #[test]
+    fn table_rows_all_have_the_same_width() {
+        let heart = "\u{2764}\u{fe0f}";
+        let md = format!("| a | b |\n|---|---|\n| {heart}{heart}{heart} | y |\n| zzzz | w |");
+        let lines = render_ast(&md, 40);
+        let first = lines[0].width();
+        for line in &lines {
+            assert_eq!(line.width(), first, "{:?}", plain(&lines));
+        }
     }
 
     #[test]

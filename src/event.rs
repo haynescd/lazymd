@@ -9,30 +9,24 @@ use crossterm::event;
 use ratatui::crossterm::event::{Event as CrosstermEvent, KeyEvent, MouseEvent};
 
 use crate::watcher::MdWatcher;
-/// Terminal events.
+/// Anything the main loop might wake up for.
 #[derive(Clone, Copy, Debug)]
 pub enum Event {
-    /// Terminal tick.
     Tick,
-    /// Key press.
     Key(KeyEvent),
-    /// Mouse click/scroll.
     Mouse(MouseEvent),
-    /// Terminal resize.
     Resize(u16, u16),
-
+    /// The watched file changed on disk.
     ReRender,
 }
 
-/// Terminal event handler.
+/// Polls the terminal and the file watcher on a background thread, and funnels
+/// both into one channel.
 #[derive(Debug)]
 pub struct EventHandler {
-    /// Event sender channel.
     #[allow(dead_code)]
     sender: mpsc::Sender<Event>,
-    /// Event receiver channel.
     receiver: mpsc::Receiver<Event>,
-    /// Event handler thread.
     #[allow(dead_code)]
     handler: thread::JoinHandle<()>,
 }
@@ -50,8 +44,8 @@ impl EventHandler {
                     let timeout = tick_rate
                         .checked_sub(last_tick.elapsed())
                         .unwrap_or(tick_rate);
-                    // A failed send means the receiver is gone — the app is
-                    // shutting down — so this thread's work is done.
+                    // A failed send means the receiver is gone and the app is
+                    // shutting down, so this thread is done.
                     if event::poll(timeout).expect("unable to poll for event") {
                         let sent = match event::read().expect("unable to read event") {
                             CrosstermEvent::Key(e) if e.kind == event::KeyEventKind::Press => {
@@ -71,8 +65,8 @@ impl EventHandler {
                             return;
                         }
 
-                        // Drain every pending fs-change signal so a burst of events from one
-                        // save (write + rename, etc.) collapses into a single re-render.
+                        // Drain the pending fs-change signals, so the burst from one
+                        // save (write + rename) collapses into a single re-render.
                         let mut changed = false;
                         while watcher.watch_rx.try_recv().is_ok() {
                             changed = true;

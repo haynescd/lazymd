@@ -1,9 +1,9 @@
 //! The color scheme, in one place.
 //!
-//! Prose elements use the terminal's named ANSI colors so they follow whatever
-//! palette the user's terminal theme defines. Code is the exception: syntax
-//! highlighting produces exact RGB colors, so code blocks (and inline code, to
-//! match) sit on the highlighter theme's own background.
+//! Prose uses the terminal's named ANSI colors, so it follows whatever palette
+//! the user's theme defines. Code is the exception: syntax highlighting produces
+//! exact RGB, so code blocks (and inline code, to match) sit on the highlighter
+//! theme's own background.
 
 use ratatui::style::{Color, Modifier, Style};
 
@@ -71,6 +71,12 @@ pub fn inline_code() -> Style {
 
 pub fn code_block() -> Style {
     Style::new().fg(CODE_FG).bg(CODE_BG)
+}
+
+/// Just the background, for layering over syntax-highlighted spans — they
+/// bring their own foreground.
+pub fn code_bg() -> Style {
+    Style::new().bg(CODE_BG)
 }
 
 pub fn code_label() -> Style {

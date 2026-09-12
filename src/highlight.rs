@@ -1,7 +1,7 @@
 //! Syntax highlighting for fenced code blocks, via `syntect`.
 //!
-//! syntect's grammars and themes take a noticeable moment to deserialize, so
-//! they're loaded once, on first use, and shared for the life of the program.
+//! syntect's grammars and themes take a moment to deserialize, so they load
+//! once on first use and are shared for the life of the program.
 
 use std::sync::LazyLock;
 
@@ -27,10 +27,9 @@ static THEME: LazyLock<Theme> = LazyLock::new(|| {
         .expect("syntax theme is bundled with syntect")
 });
 
-/// Highlights `code` as the language named by a fence's info string (`rust`,
-/// `py`, `sh`, ...). Returns one `Vec<Span>` per source line, foreground colors
-/// only — the caller owns the background. Returns `None` for an unknown or
-/// missing language so the caller can fall back to plain styling.
+/// Highlights `code` as `lang` (`rust`, `py`, `sh`, ...). One `Vec<Span>` per
+/// source line, foreground only — the caller owns the background. `None` for an
+/// unknown or missing language, so the caller can fall back to plain styling.
 pub fn highlight(code: &str, lang: &str) -> Option<Vec<Vec<Span<'static>>>> {
     if lang.is_empty() {
         return None;
