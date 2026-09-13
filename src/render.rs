@@ -51,8 +51,8 @@ struct Prefix {
     rest: Vec<Span<'static>>,
     /// What this prefix costs on every line, whichever variant gets drawn.
     width: usize,
-    /// Set once `first` has been drawn; every line after gets `rest`.
-    used: bool,
+    /// Set once the container has drawn a line; every line after gets `rest`.
+    drawn: bool,
 }
 
 impl Prefix {
@@ -63,24 +63,25 @@ impl Prefix {
             first,
             rest,
             width,
-            used: false,
+            drawn: false,
         }
     }
 
-    /// The same on every line, like a blockquote's bar.
-    fn constant(spans: Vec<Span<'static>>) -> Self {
+    /// Shown on every line, like a blockquote's bar.
+    fn every_line(spans: Vec<Span<'static>>) -> Self {
         Self::new(spans.clone(), spans)
     }
 
-    /// Shown once, then replaced by blanks of the same width, like a bullet.
-    fn marker(spans: Vec<Span<'static>>) -> Self {
+    /// Shown on the first line, like a bullet; later lines get blanks of the
+    /// same width, so the text stays aligned.
+    fn first_line(spans: Vec<Span<'static>>) -> Self {
         let rest = vec![Span::raw(" ".repeat(wrap::width(&spans)))];
         Self::new(spans, rest)
     }
 
-    /// The spans for the next line: the marker the first time, blanks after.
-    fn take(&mut self) -> &[Span<'static>] {
-        if std::mem::replace(&mut self.used, true) {
+    /// The spans to lead the next line with: `first` the first time, `rest` after.
+    fn for_next_line(&mut self) -> &[Span<'static>] {
+        if std::mem::replace(&mut self.drawn, true) {
             &self.rest
         } else {
             &self.first
@@ -200,15 +201,15 @@ impl Canvas {
     }
 
     /// Enters a container that leads every line with `prefix`.
-    fn open(&mut self, prefix: Prefix) {
+    fn open_container(&mut self, prefix: Prefix) {
         self.prefixes.push(prefix);
         self.needs_separator = false;
     }
 
     /// Leaves the innermost container.
-    fn close(&mut self) {
+    fn close_container(&mut self) {
         // A container with no content (an empty list item) still shows its marker.
-        if !self.prefixes.last().is_some_and(|p| p.used) {
+        if !self.prefixes.last().is_some_and(|p| p.drawn) {
             self.push_line(Vec::new());
         }
         self.prefixes.pop();
@@ -220,7 +221,7 @@ impl Canvas {
     fn push_line(&mut self, content: Vec<Span<'static>>) {
         let mut spans = Vec::new();
         for p in &mut self.prefixes {
-            spans.extend(p.take().iter().cloned());
+            spans.extend(p.for_next_line().iter().cloned());
         }
         spans.extend(content);
         self.lines.push(Line::from(spans));
@@ -289,7 +290,7 @@ struct Ctx {
 
 #[derive(Debug)]
 struct Renderer {
-    out: Canvas,
+    canvas: Canvas,
     /// Footnote definitions share one divider, drawn before the first of them.
     footnotes_started: bool,
 }
@@ -297,7 +298,7 @@ struct Renderer {
 impl Renderer {
     fn new(width: usize) -> Self {
         Renderer {
-            out: Canvas::new(width),
+            canvas: Canvas::new(width),
             footnotes_started: false,
         }
     }
@@ -308,7 +309,7 @@ impl Renderer {
     /// whatever came before, unless that would be wrong here.
     fn separate(&mut self, ctx: Ctx) {
         if !ctx.tight {
-            self.out.push_separator();
+            self.canvas.push_separator();
         }
     }
 
@@ -329,7 +330,7 @@ impl Renderer {
             NodeValue::Paragraph => {
                 self.separate(ctx);
                 let spans = inline::inlines(n, ctx.base_style);
-                self.out.push_wrapped(spans);
+                self.canvas.push_wrapped(spans);
             }
             NodeValue::List(nl) => self.list(n, *nl, ctx),
             // Items are handled by `list`; these only appear if one is orphaned.
@@ -360,13 +361,13 @@ impl Renderer {
 
     fn table<'a>(&mut self, n: &'a AstNode<'a>, alignments: &[TableAlignment], ctx: Ctx) {
         // Laid out before separating, so an empty table leaves no stray blank line.
-        let width = self.out.content_width();
+        let width = self.canvas.content_width();
         let Some(rows) = table::render(n, ctx.base_style, width, alignments) else {
             return;
         };
         self.separate(ctx);
         for row in rows {
-            self.out.push_line(row);
+            self.canvas.push_line(row);
         }
     }
 
@@ -374,7 +375,7 @@ impl Renderer {
         self.separate(ctx);
         let style = ctx.base_style.patch(theme::heading(level));
         let spans = inline::inlines(n, style);
-        self.out.push_wrapped(spans);
+        self.canvas.push_wrapped(spans);
 
         // Like GitHub, the top two levels get a rule underneath.
         let underline = match level {
@@ -382,22 +383,20 @@ impl Renderer {
             2 => "─",
             _ => return,
         };
-        self.out.push_rule(
-            underline,
-            self.out.content_width(),
-            theme::heading_rule(level),
-        );
+        let width = self.canvas.content_width();
+        self.canvas
+            .push_rule(underline, width, theme::heading_rule(level));
     }
 
     fn thematic_break(&mut self, ctx: Ctx) {
         self.separate(ctx);
-        self.out
-            .push_rule("─", self.out.content_width(), theme::rule());
+        let width = self.canvas.content_width();
+        self.canvas.push_rule("─", width, theme::rule());
     }
 
     /// Each item is a container led by its marker. `list` never draws the
     /// marker itself: the first line the item's content pushes picks it up (see
-    /// `Prefix::take`), which is how `- - x` gets both bullets on one line.
+    /// `Prefix::for_next_line`), which is how `- - x` gets both bullets on one line.
     fn list<'a>(&mut self, n: &'a AstNode<'a>, nl: NodeList, ctx: Ctx) {
         self.separate(ctx);
 
@@ -418,9 +417,10 @@ impl Renderer {
             if kind == ItemKind::Done {
                 item_ctx.base_style = item_ctx.base_style.patch(theme::task_done_text());
             }
-            self.out.open(Prefix::marker(marker.for_item(i, kind)));
+            let prefix = Prefix::first_line(marker.for_item(i, kind));
+            self.canvas.open_container(prefix);
             self.blocks(item, item_ctx);
-            self.out.close();
+            self.canvas.close_container();
         }
     }
 
@@ -440,26 +440,26 @@ impl Renderer {
             ..ctx
         };
 
-        self.out.open(Prefix::constant(vec![bar]));
+        self.canvas.open_container(Prefix::every_line(vec![bar]));
         if let Some(title) = title {
-            self.out.push_title(vec![title]);
+            self.canvas.push_title(vec![title]);
         }
         self.blocks(n, quote_ctx);
-        self.out.close();
+        self.canvas.close_container();
     }
 
     fn footnote_definition<'a>(&mut self, n: &'a AstNode<'a>, name: &str, ctx: Ctx) {
         if !self.footnotes_started {
             self.footnotes_started = true;
             self.separate(ctx);
-            let width = self.out.content_width().min(FOOTNOTE_RULE_WIDTH);
-            self.out.push_rule("─", width, theme::rule());
+            let width = self.canvas.content_width().min(FOOTNOTE_RULE_WIDTH);
+            self.canvas.push_rule("─", width, theme::rule());
         }
         self.separate(ctx);
         let label = Span::styled(format!("[{name}] "), theme::footnote());
-        self.out.open(Prefix::marker(vec![label]));
+        self.canvas.open_container(Prefix::first_line(vec![label]));
         self.blocks(n, ctx);
-        self.out.close();
+        self.canvas.close_container();
     }
 
     fn code_block(&mut self, info: &str, literal: &str, ctx: Ctx) {
@@ -485,7 +485,7 @@ impl Renderer {
         };
 
         // Padding every row to the full width is what makes the background solid.
-        let width = self.out.content_width();
+        let width = self.canvas.content_width();
 
         // Right-aligned on the first line, and dropped rather than allowed to
         // push that one row wider than the rest.
@@ -497,16 +497,16 @@ impl Renderer {
             }
             _ => Vec::new(),
         };
-        self.out.push_line(wrap::pad(header, width, bg));
+        self.canvas.push_line(wrap::pad(header, width, bg));
 
         for line in code {
             for chunk in wrap::wrap_anywhere(&line, width.saturating_sub(CODE_GUTTER)) {
                 let mut row = vec![Span::styled(" ", bg)];
                 row.extend(chunk);
-                self.out.push_line(wrap::pad(row, width, bg));
+                self.canvas.push_line(wrap::pad(row, width, bg));
             }
         }
-        self.out.push_line(wrap::pad(Vec::new(), width, bg));
+        self.canvas.push_line(wrap::pad(Vec::new(), width, bg));
     }
 
     /// Raw HTML or front matter: shown dimmed and verbatim. HTML comments are
@@ -517,11 +517,11 @@ impl Renderer {
             return;
         }
         self.separate(ctx);
-        let width = self.out.content_width();
+        let width = self.canvas.content_width();
         for line in literal.trim_end().lines() {
             let span = Span::styled(line.to_string(), ctx.base_style.patch(theme::html()));
             for chunk in wrap::wrap_anywhere(&[span], width) {
-                self.out.push_line(chunk);
+                self.canvas.push_line(chunk);
             }
         }
     }
@@ -559,7 +559,7 @@ pub fn render_ast(md: &str, width: usize) -> Vec<Line<'static>> {
     let mut renderer = Renderer::new(width);
     renderer.block(root, Ctx::default());
 
-    renderer.out.into_lines()
+    renderer.canvas.into_lines()
 }
 
 #[cfg(test)]
@@ -707,6 +707,12 @@ mod tests {
     fn bullet_glyphs_cycle_with_depth() {
         let out = render("- a\n  - b\n    - c\n      - d");
         assert_eq!(out, ["• a", "  ◦ b", "    ▪ c", "      • d"]);
+    }
+
+    /// An empty item still shows its bullet: `close_container` pushes a line to carry it.
+    #[test]
+    fn empty_list_item_still_shows_its_marker() {
+        assert_eq!(render("- a\n-\n- c"), ["• a", "•", "• c"]);
     }
 
     #[test]
