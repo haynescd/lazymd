@@ -47,25 +47,25 @@ struct Grid {
 /// columns at all.
 pub(super) fn render<'a>(
     n: &'a AstNode<'a>,
-    base: Style,
+    base_style: Style,
     max_width: usize,
     alignments: &[TableAlignment],
 ) -> Option<Vec<Vec<Span<'static>>>> {
-    Some(draw(&layout(n, base, max_width)?, alignments))
+    Some(draw(&layout(n, base_style, max_width)?, alignments))
 }
 
 /// Renders every cell, sizes the columns to fit, and wraps each cell to its
 /// column. `None` if the table has no columns.
-fn layout<'a>(n: &'a AstNode<'a>, base: Style, max_width: usize) -> Option<Grid> {
+fn layout<'a>(n: &'a AstNode<'a>, base_style: Style, max_width: usize) -> Option<Grid> {
     // Pass 1: render every cell, since column widths depend on all rows.
     let rendered: Vec<RawRow> = n
         .children()
         .map(|row| {
             let header = matches!(row.data.borrow().value, NodeValue::TableRow(true));
             let style = if header {
-                base.patch(theme::table_header())
+                base_style.patch(theme::table_header())
             } else {
-                base
+                base_style
             };
             let cells = row
                 .children()

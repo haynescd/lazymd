@@ -88,54 +88,85 @@ impl Prefix {
     }
 }
 
-/// Everything an item's marker needs that is fixed for the whole list.
-#[derive(Debug)]
-struct Markers {
-    list_type: ListType,
-    start: usize,
-    /// Width of the widest number, so `9.` and `10.` align their text.
-    num_width: usize,
-    delim: char,
-    depth: usize,
+/// A list item is plain, or a task that's still to do or done.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ItemKind {
+    Plain,
+    Todo,
+    Done,
 }
 
-impl Markers {
-    fn new(nl: NodeList, count: usize, depth: usize) -> Self {
-        let last = nl.start + count.saturating_sub(1);
-        Markers {
-            list_type: nl.list_type,
-            start: nl.start,
-            num_width: last.to_string().len(),
-            delim: match nl.delimiter {
-                ListDelimType::Period => '.',
-                ListDelimType::Paren => ')',
-            },
-            depth,
+impl ItemKind {
+    fn of(value: &NodeValue) -> Self {
+        match value {
+            NodeValue::TaskItem(t) if t.symbol.is_some() => ItemKind::Done,
+            NodeValue::TaskItem(_) => ItemKind::Todo,
+            _ => ItemKind::Plain,
         }
     }
 
-    /// The marker for item `i`.
-    fn at(&self, i: usize, checked: Option<bool>) -> Vec<Span<'static>> {
-        let (num_width, delim) = (self.num_width, self.delim);
-        let mut spans = Vec::new();
-        match self.list_type {
-            ListType::Ordered => spans.push(Span::styled(
-                format!("{:>num_width$}{delim} ", self.start + i),
-                theme::ordered_marker(),
-            )),
-            // A checkbox replaces the bullet rather than sitting beside it.
-            ListType::Bullet if checked.is_none() => {
-                let (glyph, style) = theme::bullet(self.depth);
-                spans.push(Span::styled(format!("{glyph} "), style));
+    /// The box a task is drawn with; plain items have none.
+    fn checkbox(self) -> Option<Span<'static>> {
+        match self {
+            ItemKind::Plain => None,
+            ItemKind::Todo => Some(Span::styled("☐ ", theme::task_todo())),
+            ItemKind::Done => Some(Span::styled("✔ ", theme::task_done())),
+        }
+    }
+}
+
+/// What leads each item of one list, fixed for the whole list. As CommonMark
+/// puts it, a list marker is a bullet list marker or an ordered list marker.
+#[derive(Debug)]
+enum ListMarker {
+    /// The same glyph on every item.
+    Bullet(Span<'static>),
+    /// A number counting up from `start`.
+    Ordered {
+        start: usize,
+        /// Width of the widest number, so `9.` and `10.` align their text.
+        width: usize,
+        delim: char,
+    },
+}
+
+impl ListMarker {
+    fn new(nl: NodeList, count: usize, depth: usize) -> Self {
+        match nl.list_type {
+            ListType::Bullet => {
+                let (glyph, style) = theme::bullet(depth);
+                ListMarker::Bullet(Span::styled(format!("{glyph} "), style))
             }
-            ListType::Bullet => {}
+            ListType::Ordered => {
+                let last = nl.start + count.saturating_sub(1);
+                ListMarker::Ordered {
+                    start: nl.start,
+                    width: last.to_string().len(),
+                    delim: match nl.delimiter {
+                        ListDelimType::Period => '.',
+                        ListDelimType::Paren => ')',
+                    },
+                }
+            }
         }
-        match checked {
-            Some(true) => spans.push(Span::styled("✔ ", theme::task_done())),
-            Some(false) => spans.push(Span::styled("☐ ", theme::task_todo())),
-            None => {}
+    }
+
+    /// The marker for the `i`th item (counting from 0).
+    fn for_item(&self, i: usize, kind: ItemKind) -> Vec<Span<'static>> {
+        match self {
+            // A checkbox replaces the bullet rather than sitting beside it.
+            ListMarker::Bullet(bullet) => vec![kind.checkbox().unwrap_or_else(|| bullet.clone())],
+            // A number stays beside a checkbox: it says where the task sits.
+            ListMarker::Ordered {
+                start,
+                width,
+                delim,
+            } => {
+                let number = format!("{:>width$}{delim} ", start + i);
+                let number = Span::styled(number, theme::ordered_marker());
+                std::iter::once(number).chain(kind.checkbox()).collect()
+            }
         }
-        spans
     }
 }
 
@@ -243,14 +274,14 @@ impl Canvas {
 /// takes it by value, so a container changes it for its children only — the
 /// call stack puts the caller's back when the container returns.
 ///
-/// Prose inherits `base`; chrome doesn't. Borders, markers, rules and cell
+/// Prose inherits `base_style`; chrome doesn't. Borders, markers, rules and cell
 /// padding are themed absolutely, so a table inside a blockquote keeps its own
 /// border color.
 #[derive(Debug, Clone, Copy, Default)]
 struct Ctx {
     /// Style every piece of text starts from — a blockquote greys it out, a
     /// checked task dims it.
-    base: Style,
+    base_style: Style,
     /// Inside a tight list, blocks aren't separated by blank lines.
     tight: bool,
     list_depth: usize,
@@ -297,7 +328,7 @@ impl Renderer {
             NodeValue::Heading(h) => self.heading(n, h.level, ctx),
             NodeValue::Paragraph => {
                 self.separate(ctx);
-                let spans = inline::inlines(n, ctx.base);
+                let spans = inline::inlines(n, ctx.base_style);
                 self.out.push_wrapped(spans);
             }
             NodeValue::List(nl) => self.list(n, *nl, ctx),
@@ -330,7 +361,7 @@ impl Renderer {
     fn table<'a>(&mut self, n: &'a AstNode<'a>, alignments: &[TableAlignment], ctx: Ctx) {
         // Laid out before separating, so an empty table leaves no stray blank line.
         let width = self.out.content_width();
-        let Some(rows) = table::render(n, ctx.base, width, alignments) else {
+        let Some(rows) = table::render(n, ctx.base_style, width, alignments) else {
             return;
         };
         self.separate(ctx);
@@ -341,7 +372,7 @@ impl Renderer {
 
     fn heading<'a>(&mut self, n: &'a AstNode<'a>, level: u8, ctx: Ctx) {
         self.separate(ctx);
-        let style = ctx.base.patch(theme::heading(level));
+        let style = ctx.base_style.patch(theme::heading(level));
         let spans = inline::inlines(n, style);
         self.out.push_wrapped(spans);
 
@@ -370,7 +401,7 @@ impl Renderer {
     fn list<'a>(&mut self, n: &'a AstNode<'a>, nl: NodeList, ctx: Ctx) {
         self.separate(ctx);
 
-        let markers = Markers::new(nl, n.children().count(), ctx.list_depth);
+        let marker = ListMarker::new(nl, n.children().count(), ctx.list_depth);
         let list_ctx = Ctx {
             tight: nl.tight,
             list_depth: ctx.list_depth + 1,
@@ -381,16 +412,13 @@ impl Renderer {
             if i > 0 {
                 self.separate(list_ctx); // a no-op in tight lists
             }
-            let checked = match item.data.borrow().value {
-                NodeValue::TaskItem(t) => Some(t.symbol.is_some()),
-                _ => None,
-            };
+            let kind = ItemKind::of(&item.data.borrow().value);
 
             let mut item_ctx = list_ctx;
-            if checked == Some(true) {
-                item_ctx.base = item_ctx.base.patch(theme::task_done_text());
+            if kind == ItemKind::Done {
+                item_ctx.base_style = item_ctx.base_style.patch(theme::task_done_text());
             }
-            self.out.open(Prefix::marker(markers.at(i, checked)));
+            self.out.open(Prefix::marker(marker.for_item(i, kind)));
             self.blocks(item, item_ctx);
             self.out.close();
         }
@@ -408,7 +436,7 @@ impl Renderer {
         self.separate(ctx);
         let quote_ctx = Ctx {
             tight: false,
-            base: ctx.base.patch(text),
+            base_style: ctx.base_style.patch(text),
             ..ctx
         };
 
@@ -491,7 +519,7 @@ impl Renderer {
         self.separate(ctx);
         let width = self.out.content_width();
         for line in literal.trim_end().lines() {
-            let span = Span::styled(line.to_string(), ctx.base.patch(theme::html()));
+            let span = Span::styled(line.to_string(), ctx.base_style.patch(theme::html()));
             for chunk in wrap::wrap_anywhere(&[span], width) {
                 self.out.push_line(chunk);
             }
@@ -669,6 +697,19 @@ mod tests {
     }
 
     #[test]
+    fn ordered_list_keeps_its_start_and_delimiter() {
+        let out = render("7) a\n8) b\n9) c\n10) d");
+        assert_eq!(out, [" 7) a", " 8) b", " 9) c", "10) d"]);
+    }
+
+    /// Pinned to `theme::BULLETS` having three glyphs: the fourth level wraps.
+    #[test]
+    fn bullet_glyphs_cycle_with_depth() {
+        let out = render("- a\n  - b\n    - c\n      - d");
+        assert_eq!(out, ["• a", "  ◦ b", "    ▪ c", "      • d"]);
+    }
+
+    #[test]
     fn wrapped_list_item_keeps_its_indent() {
         let out = plain(&render_ast("- aaa bbb ccc", 11));
         assert_eq!(out, ["• aaa bbb", "  ccc"]);
@@ -680,6 +721,15 @@ mod tests {
         assert_eq!(plain(&lines), ["✔ done", "☐ todo"]);
         assert_eq!(span_with(&lines, "done").style.fg, Some(Color::DarkGray));
         assert_eq!(span_with(&lines, "todo").style.fg, None);
+    }
+
+    /// In an ordered list the checkbox sits beside the number, not in place of it.
+    #[test]
+    fn ordered_task_items_keep_their_number() {
+        assert_eq!(
+            render("1. [x] done\n2. [ ] todo"),
+            ["1. ✔ done", "2. ☐ todo"]
+        );
     }
 
     /// A checked item dims only its own text — the next item starts clean.
