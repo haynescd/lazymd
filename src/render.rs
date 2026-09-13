@@ -10,8 +10,10 @@
 //! re-renders whenever the terminal is resized.
 //!
 //! State splits three ways: `Canvas` owns the output and how a line is placed,
-//! `Ctx` is what a block inherits from the containers around it, and `Render`
-//! holds both plus what's global to the whole document.
+//! `Ctx` is what a block inherits from the containers around it, passed down
+//! the recursion by value, and `Renderer` holds the `Canvas` plus what's global
+//! to the whole document. `Renderer` changes the `Canvas` only through its
+//! methods, never by touching its fields.
 
 use std::sync::LazyLock;
 
@@ -49,6 +51,7 @@ struct Prefix {
     rest: Vec<Span<'static>>,
     /// What this prefix costs on every line, whichever variant gets drawn.
     width: usize,
+    /// Set once `first` has been drawn; every line after gets `rest`.
     used: bool,
 }
 
@@ -136,18 +139,6 @@ impl Markers {
     }
 }
 
-/// What stands between the last line emitted and the next block: one question
-/// with three answers, rather than flags that could contradict each other.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Gap {
-    /// Nothing emitted yet, or a container just opened.
-    Open,
-    /// A blank line is already there.
-    Blank,
-    /// Content; the next block needs a separator.
-    Content,
-}
-
 /// The rendered document, and everything needed to place one more line in it.
 #[derive(Debug)]
 struct Canvas {
@@ -156,7 +147,9 @@ struct Canvas {
     lines: Vec<Line<'static>>,
     /// One entry per container we're currently inside, outermost first.
     prefixes: Vec<Prefix>,
-    gap: Gap,
+    /// Whether the next block needs a blank line before it: true after content,
+    /// false at the start, after a blank line, and when a container opens.
+    needs_separator: bool,
 }
 
 impl Canvas {
@@ -165,14 +158,31 @@ impl Canvas {
             width,
             lines: Vec::new(),
             prefixes: Vec::new(),
-            gap: Gap::Open,
+            needs_separator: false,
         }
     }
 
     /// Width left for content once every active prefix has taken its share.
-    fn avail(&self) -> usize {
+    fn content_width(&self) -> usize {
         let used: usize = self.prefixes.iter().map(|p| p.width).sum();
         self.width.saturating_sub(used).max(MIN_TEXT_WIDTH)
+    }
+
+    /// Enters a container that leads every line with `prefix`.
+    fn open(&mut self, prefix: Prefix) {
+        self.prefixes.push(prefix);
+        self.needs_separator = false;
+    }
+
+    /// Leaves the innermost container.
+    fn close(&mut self) {
+        // A container with no content (an empty list item) still shows its marker.
+        if !self.prefixes.last().is_some_and(|p| p.used) {
+            self.push_line(Vec::new());
+        }
+        self.prefixes.pop();
+        // It drew at least its own marker, so the next block needs a separator.
+        self.needs_separator = true;
     }
 
     /// Emits one line of content behind the current prefixes.
@@ -183,36 +193,55 @@ impl Canvas {
         }
         spans.extend(content);
         self.lines.push(Line::from(spans));
-        self.gap = Gap::Content;
+        self.needs_separator = true;
+    }
+
+    /// Emits a line the next block follows directly, with no separator.
+    fn push_title(&mut self, content: Vec<Span<'static>>) {
+        self.push_line(content);
+        self.needs_separator = false;
     }
 
     /// Emits a blank separator line. It keeps visible prefixes (a quote's bar
     /// continues through it) but never uses up a pending list marker.
-    fn blank(&mut self) {
+    fn push_blank(&mut self) {
         let spans: Vec<_> = self
             .prefixes
             .iter()
             .flat_map(|p| p.rest.iter().cloned())
             .collect();
         self.lines.push(Line::from(spans));
-        self.gap = Gap::Blank;
+        self.needs_separator = false;
     }
 
-    /// Word-wraps `spans` to the available width and emits the result.
-    fn wrapped(&mut self, spans: Vec<Span<'static>>) {
-        for line in wrap::wrap(&spans, self.avail()) {
+    /// Emits a blank line if content came before it; otherwise nothing.
+    fn push_separator(&mut self) {
+        if self.needs_separator {
+            self.push_blank();
+        }
+    }
+
+    /// Word-wraps `spans` to the content width and emits the result.
+    fn push_wrapped(&mut self, spans: Vec<Span<'static>>) {
+        for line in wrap::wrap(&spans, self.content_width()) {
             self.push_line(line);
         }
     }
 
     /// Emits a horizontal rule `width` columns wide.
-    fn rule(&mut self, glyph: &str, width: usize, style: Style) {
+    fn push_rule(&mut self, glyph: &str, width: usize, style: Style) {
         self.push_line(vec![Span::styled(glyph.repeat(width), style)]);
+    }
+
+    /// The finished document.
+    fn into_lines(self) -> Vec<Line<'static>> {
+        self.lines
     }
 }
 
-/// What a block inherits from the containers around it. `Render::scoped` and
-/// `Render::nested` save and restore it.
+/// What a block inherits from the containers around it. Every block method
+/// takes it by value, so a container changes it for its children only — the
+/// call stack puts the caller's back when the container returns.
 ///
 /// Prose inherits `base`; chrome doesn't. Borders, markers, rules and cell
 /// padding are themed absolutely, so a table inside a blockquote keeps its own
@@ -228,18 +257,16 @@ struct Ctx {
 }
 
 #[derive(Debug)]
-struct Render {
+struct Renderer {
     out: Canvas,
-    ctx: Ctx,
     /// Footnote definitions share one divider, drawn before the first of them.
     footnotes_started: bool,
 }
 
-impl Render {
+impl Renderer {
     fn new(width: usize) -> Self {
-        Render {
+        Renderer {
             out: Canvas::new(width),
-            ctx: Ctx::default(),
             footnotes_started: false,
         }
     }
@@ -248,63 +275,41 @@ impl Render {
 
     /// Called at the start of each block: leaves one blank line between it and
     /// whatever came before, unless that would be wrong here.
-    fn separate(&mut self) {
-        if self.out.gap == Gap::Content && !self.ctx.tight {
-            self.out.blank();
+    fn separate(&mut self, ctx: Ctx) {
+        if !ctx.tight {
+            self.out.push_separator();
         }
-    }
-
-    /// Runs `f` with `ctx` in force, then puts the caller's context back.
-    fn scoped(&mut self, ctx: Ctx, f: impl FnOnce(&mut Self)) {
-        let saved = std::mem::replace(&mut self.ctx, ctx);
-        f(self);
-        self.ctx = saved;
-    }
-
-    /// Runs `f` inside a container that leads every line with `prefix` and
-    /// renders under `ctx`. Both are unwound when it closes.
-    fn nested(&mut self, prefix: Prefix, ctx: Ctx, f: impl FnOnce(&mut Self)) {
-        self.out.prefixes.push(prefix);
-        self.out.gap = Gap::Open;
-        self.scoped(ctx, f);
-        // A container with no content (an empty list item) still shows its marker.
-        if !self.out.prefixes.last().is_some_and(|p| p.used) {
-            self.out.push_line(Vec::new());
-        }
-        self.out.prefixes.pop();
-        // It drew at least its own marker, so the next block needs a separator.
-        self.out.gap = Gap::Content;
     }
 
     // --- blocks ------------------------------------------------------------
 
-    fn blocks<'a>(&mut self, n: &'a AstNode<'a>) {
+    fn blocks<'a>(&mut self, n: &'a AstNode<'a>, ctx: Ctx) {
         for child in n.children() {
-            self.block(child);
+            self.block(child, ctx);
         }
     }
 
-    fn block<'a>(&mut self, n: &'a AstNode<'a>) {
+    fn block<'a>(&mut self, n: &'a AstNode<'a>, ctx: Ctx) {
         let data = n.data.borrow();
 
         match &data.value {
-            NodeValue::Document => self.blocks(n),
-            NodeValue::Heading(h) => self.heading(n, h.level),
+            NodeValue::Document => self.blocks(n, ctx),
+            NodeValue::Heading(h) => self.heading(n, h.level, ctx),
             NodeValue::Paragraph => {
-                self.separate();
-                let spans = inline::inlines(n, self.ctx.base);
-                self.out.wrapped(spans);
+                self.separate(ctx);
+                let spans = inline::inlines(n, ctx.base);
+                self.out.push_wrapped(spans);
             }
-            NodeValue::List(nl) => self.list(n, *nl),
+            NodeValue::List(nl) => self.list(n, *nl, ctx),
             // Items are handled by `list`; these only appear if one is orphaned.
-            NodeValue::Item(_) | NodeValue::TaskItem(_) => self.blocks(n),
-            NodeValue::CodeBlock(cb) => self.code_block(&cb.info, &cb.literal),
-            NodeValue::HtmlBlock(hb) => self.literal_block(&hb.literal),
-            NodeValue::FrontMatter(fm) => self.literal_block(fm),
-            NodeValue::ThematicBreak => self.thematic_break(),
+            NodeValue::Item(_) | NodeValue::TaskItem(_) => self.blocks(n, ctx),
+            NodeValue::CodeBlock(cb) => self.code_block(&cb.info, &cb.literal, ctx),
+            NodeValue::HtmlBlock(hb) => self.literal_block(&hb.literal, ctx),
+            NodeValue::FrontMatter(fm) => self.literal_block(fm, ctx),
+            NodeValue::ThematicBreak => self.thematic_break(ctx),
             NodeValue::BlockQuote | NodeValue::MultilineBlockQuote(_) => {
                 let bar = Span::styled("▎ ", theme::quote_bar());
-                self.quote(n, bar, theme::quote_text(), None);
+                self.quote(n, bar, theme::quote_text(), None, ctx);
             }
             NodeValue::Alert(alert) => {
                 let style = theme::alert(alert.alert_type);
@@ -313,31 +318,32 @@ impl Render {
                     .clone()
                     .unwrap_or_else(|| alert.alert_type.default_title().to_string());
                 let title = Span::styled(title, style.add_modifier(Modifier::BOLD));
-                self.quote(n, Span::styled("▎ ", style), Style::default(), Some(title));
+                let bar = Span::styled("▎ ", style);
+                self.quote(n, bar, Style::default(), Some(title), ctx);
             }
-            NodeValue::Table(table) => self.table(n, &table.alignments),
-            NodeValue::FootnoteDefinition(def) => self.footnote_definition(n, &def.name),
-            _ => self.blocks(n),
+            NodeValue::Table(table) => self.table(n, &table.alignments, ctx),
+            NodeValue::FootnoteDefinition(def) => self.footnote_definition(n, &def.name, ctx),
+            _ => self.blocks(n, ctx),
         }
     }
 
-    fn table<'a>(&mut self, n: &'a AstNode<'a>, alignments: &[TableAlignment]) {
+    fn table<'a>(&mut self, n: &'a AstNode<'a>, alignments: &[TableAlignment], ctx: Ctx) {
         // Laid out before separating, so an empty table leaves no stray blank line.
-        let avail = self.out.avail();
-        let Some(rows) = table::render(n, self.ctx.base, avail, alignments) else {
+        let width = self.out.content_width();
+        let Some(rows) = table::render(n, ctx.base, width, alignments) else {
             return;
         };
-        self.separate();
+        self.separate(ctx);
         for row in rows {
             self.out.push_line(row);
         }
     }
 
-    fn heading<'a>(&mut self, n: &'a AstNode<'a>, level: u8) {
-        self.separate();
-        let style = self.ctx.base.patch(theme::heading(level));
+    fn heading<'a>(&mut self, n: &'a AstNode<'a>, level: u8, ctx: Ctx) {
+        self.separate(ctx);
+        let style = ctx.base.patch(theme::heading(level));
         let spans = inline::inlines(n, style);
-        self.out.wrapped(spans);
+        self.out.push_wrapped(spans);
 
         // Like GitHub, the top two levels get a rule underneath.
         let underline = match level {
@@ -345,42 +351,49 @@ impl Render {
             2 => "─",
             _ => return,
         };
+        self.out.push_rule(
+            underline,
+            self.out.content_width(),
+            theme::heading_rule(level),
+        );
+    }
+
+    fn thematic_break(&mut self, ctx: Ctx) {
+        self.separate(ctx);
         self.out
-            .rule(underline, self.out.avail(), theme::heading_rule(level));
+            .push_rule("─", self.out.content_width(), theme::rule());
     }
 
-    fn thematic_break(&mut self) {
-        self.separate();
-        self.out.rule("─", self.out.avail(), theme::rule());
-    }
+    /// Each item is a container led by its marker. `list` never draws the
+    /// marker itself: the first line the item's content pushes picks it up (see
+    /// `Prefix::take`), which is how `- - x` gets both bullets on one line.
+    fn list<'a>(&mut self, n: &'a AstNode<'a>, nl: NodeList, ctx: Ctx) {
+        self.separate(ctx);
 
-    fn list<'a>(&mut self, n: &'a AstNode<'a>, nl: NodeList) {
-        self.separate();
+        let markers = Markers::new(nl, n.children().count(), ctx.list_depth);
+        let list_ctx = Ctx {
+            tight: nl.tight,
+            list_depth: ctx.list_depth + 1,
+            ..ctx
+        };
 
-        let markers = Markers::new(nl, n.children().count(), self.ctx.list_depth);
-        let mut ctx = self.ctx;
-        ctx.tight = nl.tight;
-        ctx.list_depth += 1;
-
-        self.scoped(ctx, |r| {
-            for (i, item) in n.children().enumerate() {
-                if i > 0 {
-                    r.separate(); // a no-op in tight lists
-                }
-                let checked = match item.data.borrow().value {
-                    NodeValue::TaskItem(t) => Some(t.symbol.is_some()),
-                    _ => None,
-                };
-
-                let mut item_ctx = r.ctx;
-                if checked == Some(true) {
-                    item_ctx.base = item_ctx.base.patch(theme::task_done_text());
-                }
-                r.nested(Prefix::marker(markers.at(i, checked)), item_ctx, |r| {
-                    r.blocks(item)
-                });
+        for (i, item) in n.children().enumerate() {
+            if i > 0 {
+                self.separate(list_ctx); // a no-op in tight lists
             }
-        });
+            let checked = match item.data.borrow().value {
+                NodeValue::TaskItem(t) => Some(t.symbol.is_some()),
+                _ => None,
+            };
+
+            let mut item_ctx = list_ctx;
+            if checked == Some(true) {
+                item_ctx.base = item_ctx.base.patch(theme::task_done_text());
+            }
+            self.out.open(Prefix::marker(markers.at(i, checked)));
+            self.blocks(item, item_ctx);
+            self.out.close();
+        }
     }
 
     /// A blockquote or alert: a colored bar down the left, an optional title.
@@ -390,36 +403,39 @@ impl Render {
         bar: Span<'static>,
         text: Style,
         title: Option<Span<'static>>,
+        ctx: Ctx,
     ) {
-        self.separate();
-        let mut ctx = self.ctx;
-        ctx.tight = false;
-        ctx.base = ctx.base.patch(text);
+        self.separate(ctx);
+        let quote_ctx = Ctx {
+            tight: false,
+            base: ctx.base.patch(text),
+            ..ctx
+        };
 
-        self.nested(Prefix::constant(vec![bar]), ctx, |r| {
-            if let Some(title) = title {
-                r.out.push_line(vec![title]);
-                r.out.gap = Gap::Open; // no gap between an alert's title and its body
-            }
-            r.blocks(n);
-        });
+        self.out.open(Prefix::constant(vec![bar]));
+        if let Some(title) = title {
+            self.out.push_title(vec![title]);
+        }
+        self.blocks(n, quote_ctx);
+        self.out.close();
     }
 
-    fn footnote_definition<'a>(&mut self, n: &'a AstNode<'a>, name: &str) {
+    fn footnote_definition<'a>(&mut self, n: &'a AstNode<'a>, name: &str, ctx: Ctx) {
         if !self.footnotes_started {
             self.footnotes_started = true;
-            self.separate();
-            let width = self.out.avail().min(FOOTNOTE_RULE_WIDTH);
-            self.out.rule("─", width, theme::rule());
+            self.separate(ctx);
+            let width = self.out.content_width().min(FOOTNOTE_RULE_WIDTH);
+            self.out.push_rule("─", width, theme::rule());
         }
-        self.separate();
+        self.separate(ctx);
         let label = Span::styled(format!("[{name}] "), theme::footnote());
-        let ctx = self.ctx;
-        self.nested(Prefix::marker(vec![label]), ctx, |r| r.blocks(n));
+        self.out.open(Prefix::marker(vec![label]));
+        self.blocks(n, ctx);
+        self.out.close();
     }
 
-    fn code_block(&mut self, info: &str, literal: &str) {
-        self.separate();
+    fn code_block(&mut self, info: &str, literal: &str, ctx: Ctx) {
+        self.separate(ctx);
         let lang = fence_language(info);
         // syntect reads indentation itself, so tabs are expanded before it sees them.
         let literal = wrap::expand_tabs(literal);
@@ -441,7 +457,7 @@ impl Render {
         };
 
         // Padding every row to the full width is what makes the background solid.
-        let width = self.out.avail();
+        let width = self.out.content_width();
 
         // Right-aligned on the first line, and dropped rather than allowed to
         // push that one row wider than the rest.
@@ -467,15 +483,15 @@ impl Render {
 
     /// Raw HTML or front matter: shown dimmed and verbatim. HTML comments are
     /// hidden, as they would be in a browser.
-    fn literal_block(&mut self, literal: &str) {
+    fn literal_block(&mut self, literal: &str, ctx: Ctx) {
         let trimmed = literal.trim();
         if trimmed.is_empty() || (trimmed.starts_with("<!--") && trimmed.ends_with("-->")) {
             return;
         }
-        self.separate();
-        let width = self.out.avail();
+        self.separate(ctx);
+        let width = self.out.content_width();
         for line in literal.trim_end().lines() {
-            let span = Span::styled(line.to_string(), self.ctx.base.patch(theme::html()));
+            let span = Span::styled(line.to_string(), ctx.base.patch(theme::html()));
             for chunk in wrap::wrap_anywhere(&[span], width) {
                 self.out.push_line(chunk);
             }
@@ -512,10 +528,10 @@ pub fn render_ast(md: &str, width: usize) -> Vec<Line<'static>> {
     let arena = Arena::new();
     let root = parse_document(&arena, md, &OPTIONS);
 
-    let mut render = Render::new(width);
-    render.block(root);
+    let mut renderer = Renderer::new(width);
+    renderer.block(root, Ctx::default());
 
-    render.out.lines
+    renderer.out.into_lines()
 }
 
 #[cfg(test)]

@@ -43,20 +43,20 @@ struct Grid {
     multiline: bool,
 }
 
-/// Lays `n` out to fit in `avail` columns and draws it. `None` if it has no
+/// Lays `n` out to fit in `max_width` columns and draws it. `None` if it has no
 /// columns at all.
 pub(super) fn render<'a>(
     n: &'a AstNode<'a>,
     base: Style,
-    avail: usize,
+    max_width: usize,
     alignments: &[TableAlignment],
 ) -> Option<Vec<Vec<Span<'static>>>> {
-    Some(draw(&layout(n, base, avail)?, alignments))
+    Some(draw(&layout(n, base, max_width)?, alignments))
 }
 
 /// Renders every cell, sizes the columns to fit, and wraps each cell to its
 /// column. `None` if the table has no columns.
-fn layout<'a>(n: &'a AstNode<'a>, base: Style, avail: usize) -> Option<Grid> {
+fn layout<'a>(n: &'a AstNode<'a>, base: Style, max_width: usize) -> Option<Grid> {
     // Pass 1: render every cell, since column widths depend on all rows.
     let rendered: Vec<RawRow> = n
         .children()
@@ -91,7 +91,7 @@ fn layout<'a>(n: &'a AstNode<'a>, base: Style, avail: usize) -> Option<Grid> {
             *w = (*w).max(wrap::max_line_width(cell));
         }
     }
-    let budget = avail.saturating_sub(CELL_CHROME * columns + 1);
+    let budget = max_width.saturating_sub(CELL_CHROME * columns + 1);
     fit_columns(&mut widths, budget);
 
     // Pass 3: wrap each cell to the column it ended up with.

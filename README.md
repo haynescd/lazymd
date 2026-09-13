@@ -68,7 +68,7 @@ Open the same file in your editor, make a change, save — the preview updates.
 
 1. **Parse** — `comrak::parse_document` turns the Markdown into an AST (a tree of
    `NodeValue` enum variants).
-2. **Render** — the `Render` struct walks that tree recursively. Inline nodes
+2. **Render** — the `Renderer` struct walks that tree recursively. Inline nodes
    (bold, italic, code, links) fold into styled `ratatui` `Span`s; block nodes
    (headings, paragraphs, lists, code blocks, tables) word-wrap those spans to
    the terminal width and emit `Line`s. Each enclosing container (a list item,
