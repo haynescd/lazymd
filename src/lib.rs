@@ -19,24 +19,73 @@ pub mod tui;
 /// Lines moved per mouse-wheel notch.
 const WHEEL_STEP: usize = 3;
 
-#[derive(Debug)]
+pub const USAGE: &str = "\
+codon - a terminal Markdown previewer with live reload
+
+Usage: codon [OPTIONS] <FILE>
+
+Options:
+  -h, --help       Print this help
+  -V, --version    Print the version
+
+Environment:
+  CODON_LOG        Log level: off, error, warn, info (default), debug, trace
+
+Keys:
+  q, Esc, Ctrl-c   Quit
+  j, k             Scroll down / up
+  d, u             Half page down / up
+  Space, b         Page down / up
+  g, G             Jump to top / bottom
+  r                Reload now
+";
+
+/// What the command line asked for.
+#[derive(Debug, PartialEq)]
+pub enum Command {
+    Run(Config),
+    Help,
+    Version,
+}
+
+#[derive(Debug, PartialEq)]
 pub struct Config {
     pub file_path: String,
 }
 
-impl Config {
-    pub fn build(args: &[String]) -> Result<Config, &'static str> {
-        if args.len() < 2 {
-            return Err("No md passed in");
+/// Parses the command line, `args[0]` being the program name.
+///
+/// `--` ends option parsing, so `codon -- -notes.md` opens a file whose name
+/// starts with a dash.
+pub fn parse_args(args: &[String]) -> Result<Command, String> {
+    let mut files = Vec::new();
+    let mut options_done = false;
+    for arg in args.iter().skip(1) {
+        match arg.as_str() {
+            _ if options_done => files.push(arg),
+            "-h" | "--help" => return Ok(Command::Help),
+            "-V" | "--version" => return Ok(Command::Version),
+            "--" => options_done = true,
+            opt if opt.starts_with('-') => return Err(format!("unknown option: {opt}")),
+            _ => files.push(arg),
         }
+    }
 
-        let file_path = args[1].clone();
-        Ok(Config { file_path })
+    match files.as_slice() {
+        [file] => Ok(Command::Run(Config {
+            file_path: file.to_string(),
+        })),
+        [] => Err("no file given".to_string()),
+        _ => Err(format!("expected one file, got {}", files.len())),
     }
 }
 
 pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
-    logging::init()?;
+    // Logs are a debugging aid; codon runs fine without them. This lands on the
+    // main screen, so it's still there once the TUI exits.
+    if let Err(e) = logging::init() {
+        eprintln!("codon: logging disabled: {e}");
+    }
     log::info!("codon starting for {}", config.file_path);
 
     let file_path = config.file_path.clone();
@@ -112,5 +161,69 @@ fn handle_mouse_event(mouse_event: MouseEvent, app: &mut App) {
         MouseEventKind::ScrollDown => app.scroll_down(WHEEL_STEP),
         MouseEventKind::ScrollUp => app.scroll_up(WHEEL_STEP),
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Result<Command, String> {
+        let args: Vec<String> = std::iter::once("codon")
+            .chain(args.iter().copied())
+            .map(String::from)
+            .collect();
+        parse_args(&args)
+    }
+
+    fn run_cmd(file_path: &str) -> Result<Command, String> {
+        Ok(Command::Run(Config {
+            file_path: file_path.to_string(),
+        }))
+    }
+
+    #[test]
+    fn one_file_runs() {
+        assert_eq!(parse(&["notes.md"]), run_cmd("notes.md"));
+    }
+
+    #[test]
+    fn help_and_version_flags() {
+        assert_eq!(parse(&["-h"]), Ok(Command::Help));
+        assert_eq!(parse(&["--help"]), Ok(Command::Help));
+        assert_eq!(parse(&["-V"]), Ok(Command::Version));
+        assert_eq!(parse(&["--version"]), Ok(Command::Version));
+    }
+
+    #[test]
+    fn help_after_file_still_wins() {
+        assert_eq!(parse(&["notes.md", "--help"]), Ok(Command::Help));
+    }
+
+    #[test]
+    fn unknown_option_is_an_error() {
+        assert_eq!(
+            parse(&["--bogus", "notes.md"]),
+            Err("unknown option: --bogus".to_string())
+        );
+    }
+
+    #[test]
+    fn no_file_is_an_error() {
+        assert_eq!(parse(&[]), Err("no file given".to_string()));
+    }
+
+    #[test]
+    fn two_files_is_an_error() {
+        assert_eq!(
+            parse(&["a.md", "b.md"]),
+            Err("expected one file, got 2".to_string())
+        );
+    }
+
+    #[test]
+    fn double_dash_ends_options() {
+        assert_eq!(parse(&["--", "-notes.md"]), run_cmd("-notes.md"));
+        assert_eq!(parse(&["--", "--help"]), run_cmd("--help"));
     }
 }
