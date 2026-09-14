@@ -20,16 +20,16 @@ pub mod tui;
 const WHEEL_STEP: usize = 3;
 
 pub const USAGE: &str = "\
-codon - a terminal Markdown previewer with live reload
+lazymd - a terminal Markdown previewer with live reload
 
-Usage: codon [OPTIONS] <FILE>
+Usage: lazymd [OPTIONS] <FILE>
 
 Options:
   -h, --help       Print this help
   -V, --version    Print the version
 
 Environment:
-  CODON_LOG        Log level: off, error, warn, info (default), debug, trace
+  LAZYMD_LOG       Log level: off, error, warn, info (default), debug, trace
 
 Keys:
   q, Esc, Ctrl-c   Quit
@@ -55,7 +55,7 @@ pub struct Config {
 
 /// Parses the command line, `args[0]` being the program name.
 ///
-/// `--` ends option parsing, so `codon -- -notes.md` opens a file whose name
+/// `--` ends option parsing, so `lazymd -- -notes.md` opens a file whose name
 /// starts with a dash.
 pub fn parse_args(args: &[String]) -> Result<Command, String> {
     let mut files = Vec::new();
@@ -81,12 +81,12 @@ pub fn parse_args(args: &[String]) -> Result<Command, String> {
 }
 
 pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
-    // Logs are a debugging aid; codon runs fine without them. This lands on the
+    // Logs are a debugging aid; lazymd runs fine without them. This lands on the
     // main screen, so it's still there once the TUI exits.
     if let Err(e) = logging::init() {
-        eprintln!("codon: logging disabled: {e}");
+        eprintln!("lazymd: logging disabled: {e}");
     }
-    log::info!("codon starting for {}", config.file_path);
+    log::info!("lazymd starting for {}", config.file_path);
 
     let file_path = config.file_path.clone();
     // Read before touching the terminal, so a bad path is a plain error message.
@@ -169,7 +169,7 @@ mod tests {
     use super::*;
 
     fn parse(args: &[&str]) -> Result<Command, String> {
-        let args: Vec<String> = std::iter::once("codon")
+        let args: Vec<String> = std::iter::once("lazymd")
             .chain(args.iter().copied())
             .map(String::from)
             .collect();

@@ -1,12 +1,12 @@
 [package]
-name = "codon"
+name = "lazymd"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
 description = "A fast terminal Markdown previewer with live reload"
 license = "MIT"
-repository = "https://github.com/haynescd/codon"
-homepage = "https://github.com/haynescd/codon"
+repository = "https://github.com/haynescd/lazymd"
+homepage = "https://github.com/haynescd/lazymd"
 readme = "README.md"
 keywords = ["markdown", "tui", "terminal", "preview", "cli"]
 categories = ["command-line-utilities", "text-processing"]

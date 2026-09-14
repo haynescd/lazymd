@@ -24,7 +24,7 @@ pub fn ui(app: &mut App, frame: &mut Frame) {
         Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(frame.area());
 
     let title = Line::from(vec![
-        Span::styled(" codon ", theme::title()),
+        Span::styled(" lazymd ", theme::title()),
         Span::styled("│ ", theme::border()),
         Span::styled(
             format!("{} ", app.file_name()),
