@@ -168,22 +168,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f079e83a288787bcd14a6aea84cee5c87a67c5a3e660c30f557a3d24761b3527"
 
 [[package]]
-name = "codon"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "comrak",
- "crossterm",
- "log",
- "notify",
- "ratatui",
- "simplelog",
- "syntect",
- "unicode-segmentation",
- "unicode-width",
-]
-
-[[package]]
 name = "compact_str"
 version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -723,6 +707,22 @@ name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
+
+[[package]]
+name = "lazymd"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "comrak",
+ "crossterm",
+ "log",
+ "notify",
+ "ratatui",
+ "simplelog",
+ "syntect",
+ "unicode-segmentation",
+ "unicode-width",
+]
 
 [[package]]
 name = "libc"

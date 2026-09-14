@@ -1,15 +1,16 @@
-# Codon
+# lazymd
 
-[![Build status](https://github.com/haynescd/codon/actions/workflows/ci.yml/badge.svg)](https://github.com/haynescd/codon/actions/workflows/ci.yml)
-[![Version](https://img.shields.io/github/v/release/haynescd/codon)](https://github.com/haynescd/codon/releases/latest)
+[![Build status](https://github.com/haynescd/lazymd/actions/workflows/ci.yml/badge.svg)](https://github.com/haynescd/lazymd/actions/workflows/ci.yml)
+[![Version](https://img.shields.io/github/v/release/haynescd/lazymd)](https://github.com/haynescd/lazymd/releases/latest)
 
 A fast terminal Markdown previewer, written in Rust. Point it at a file and get
 a live, styled render right in your terminal — edit in your editor of choice,
 save, and the preview updates instantly.
 
-> **Why "Codon"?** A codon is the smallest coding unit that gets *read and
-> translated* into something else. That's the whole job of a previewer: read the
-> Markdown source, render the output. (Started as a side project to learn Rust.)
+> **Why "lazymd"?** In the spirit of [lazygit](https://github.com/jesseduffield/lazygit):
+> a keyboard-driven terminal tool that saves you a trip somewhere else — here,
+> the browser. Open a file once and stay lazy; every save shows up on its own.
+> (Started as a side project to learn Rust.)
 
 ## Features
 
@@ -33,42 +34,42 @@ save, and the preview updates instantly.
 ## Install
 
 Prebuilt binaries for Linux, macOS, and Windows (x86_64 and ARM64 on Linux
-and macOS) are attached to each [GitHub release](https://github.com/haynescd/codon/releases/latest).
-The installer scripts download the right one and put `codon` on your `PATH`.
+and macOS) are attached to each [GitHub release](https://github.com/haynescd/lazymd/releases/latest).
+The installer scripts download the right one and put `lazymd` on your `PATH`.
 
 **Linux / macOS:**
 
 ```sh
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/haynescd/codon/releases/latest/download/codon-installer.sh | sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/haynescd/lazymd/releases/latest/download/lazymd-installer.sh | sh
 ```
 
 **Windows (PowerShell):**
 
 ```powershell
-powershell -ExecutionPolicy Bypass -c "irm https://github.com/haynescd/codon/releases/latest/download/codon-installer.ps1 | iex"
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/haynescd/lazymd/releases/latest/download/lazymd-installer.ps1 | iex"
 ```
 
 **From source** (Rust 1.88 or newer, via [rustup.rs](https://rustup.rs)):
 
 ```sh
-cargo install --git https://github.com/haynescd/codon
+cargo install --git https://github.com/haynescd/lazymd
 ```
 
 or clone and build it yourself:
 
 ```sh
-git clone https://github.com/haynescd/codon.git
-cd codon
-cargo build --release   # binary lands at target/release/codon
+git clone https://github.com/haynescd/lazymd.git
+cd lazymd
+cargo build --release   # binary lands at target/release/lazymd
 ```
 
 ## Usage
 
 ```sh
-codon path/to/notes.md
-codon --help                  # flags, keys, and environment variables
-codon --version
-cargo run -- test/showcase.md # during development
+lazymd path/to/notes.md
+lazymd --help                  # flags, keys, and environment variables
+lazymd --version
+cargo run -- test/showcase.md  # during development
 ```
 
 Open the same file in your editor, make a change, save — the preview updates.
@@ -87,7 +88,7 @@ Open the same file in your editor, make a change, save — the preview updates.
 | `r`                    | Reload now        |
 | mouse wheel            | Scroll            |
 
-`test/showcase.md` exercises every element codon can draw.
+`test/showcase.md` exercises every element lazymd can draw.
 
 ## How it works
 
@@ -129,9 +130,9 @@ Built as a learning ladder — each milestone runs on its own:
 - Code blocks use 24-bit color; terminals without truecolor support will show
   approximate colors.
 - Link URLs aren't shown — just the underlined link text, as in a browser.
-- Logs go to `$XDG_STATE_HOME/codon/codon.log` (usually
-  `~/.local/state/codon/codon.log`; `%LOCALAPPDATA%\codon\codon.log` on
-  Windows), overwritten on each launch. Set `CODON_LOG` to `off`, `error`,
+- Logs go to `$XDG_STATE_HOME/lazymd/lazymd.log` (usually
+  `~/.local/state/lazymd/lazymd.log`; `%LOCALAPPDATA%\lazymd\lazymd.log` on
+  Windows), overwritten on each launch. Set `LAZYMD_LOG` to `off`, `error`,
   `warn`, `info` (the default), `debug`, or `trace` to change how much is
   written.
 

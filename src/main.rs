@@ -1,6 +1,6 @@
 use std::{env, process};
 
-use codon::{Command, USAGE, parse_args, run};
+use lazymd::{Command, USAGE, parse_args, run};
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -12,18 +12,18 @@ fn main() {
             return;
         }
         Ok(Command::Version) => {
-            println!("codon {}", env!("CARGO_PKG_VERSION"));
+            println!("lazymd {}", env!("CARGO_PKG_VERSION"));
             return;
         }
         Err(err) => {
-            eprintln!("codon: {err}");
-            eprintln!("Try 'codon --help' for more information.");
+            eprintln!("lazymd: {err}");
+            eprintln!("Try 'lazymd --help' for more information.");
             process::exit(2);
         }
     };
 
     if let Err(err) = run(config) {
-        eprintln!("codon: {err}");
+        eprintln!("lazymd: {err}");
         process::exit(1);
     }
 }

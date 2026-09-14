@@ -7,15 +7,15 @@ use simplelog::{Config, WriteLogger};
 /// Sets up file-based logging for the TUI.
 ///
 /// The TUI owns the terminal, so `println!` output is overwritten by the next
-/// redraw before anyone sees it. Everything goes to `codon.log` in the user's
+/// redraw before anyone sees it. Everything goes to `lazymd.log` in the user's
 /// state directory instead (see [`log_dir`]), truncated on each launch so it
-/// only ever holds the latest session. `CODON_LOG` picks the level (`off`,
+/// only ever holds the latest session. `LAZYMD_LOG` picks the level (`off`,
 /// `error`, `warn`, `info`, `debug`, `trace`; default `info`), and `log::info!`
 /// and friends work crate-wide once this has run.
 pub fn init() -> anyhow::Result<()> {
-    let level = match env::var("CODON_LOG") {
+    let level = match env::var("LAZYMD_LOG") {
         Ok(value) => LevelFilter::from_str(&value)
-            .map_err(|_| anyhow!("CODON_LOG={value} isn't a log level"))?,
+            .map_err(|_| anyhow!("LAZYMD_LOG={value} isn't a log level"))?,
         Err(_) => LevelFilter::Info,
     };
     if level == LevelFilter::Off {
@@ -23,7 +23,7 @@ pub fn init() -> anyhow::Result<()> {
     }
 
     let log_dir = log_dir().context("no state directory to log to")?;
-    let log_path = log_dir.join("codon.log");
+    let log_path = log_dir.join("lazymd.log");
     let log_file = fs::create_dir_all(&log_dir)
         .and_then(|_| fs::File::create(&log_path))
         .with_context(|| format!("couldn't open {}", log_path.display()))?;
@@ -32,8 +32,8 @@ pub fn init() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Where the log file lives: `$XDG_STATE_HOME/codon`, falling back to
-/// `~/.local/state/codon` per the XDG spec, then `%LOCALAPPDATA%\codon` on
+/// Where the log file lives: `$XDG_STATE_HOME/lazymd`, falling back to
+/// `~/.local/state/lazymd` per the XDG spec, then `%LOCALAPPDATA%\lazymd` on
 /// Windows.
 fn log_dir() -> Option<PathBuf> {
     let from = |var: &str| {
@@ -44,5 +44,5 @@ fn log_dir() -> Option<PathBuf> {
     from("XDG_STATE_HOME")
         .or_else(|| from("HOME").map(|home| home.join(".local").join("state")))
         .or_else(|| from("LOCALAPPDATA"))
-        .map(|dir| dir.join("codon"))
+        .map(|dir| dir.join("lazymd"))
 }
