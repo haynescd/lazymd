@@ -1,0 +1,20 @@
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    # One PR for the routine bumps; major versions still get their own.
+    groups:
+      cargo:
+        patterns: ["*"]
+        update-types: [minor, patch]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    # dist generates release.yml and fails CI if it's edited by hand. Its
+    # actions move forward when dist itself is upgraded.
+    exclude-paths:
+      - .github/workflows/release.yml
