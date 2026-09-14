@@ -6,6 +6,8 @@ use ratatui::{
     widgets::{Block, BorderType, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
 };
 
+use unicode_width::UnicodeWidthStr;
+
 use crate::{app::App, theme};
 
 /// Key hints shown in the status line when there's no message to show.
@@ -36,15 +38,15 @@ pub fn ui(app: &mut App, frame: &mut Frame) {
     // One column of breathing room between the border and the text.
     let content = block.inner(main).inner(Margin::new(1, 0));
 
-    // Layout comes first: it may re-render the document at a new width, and
-    // everything below reads the result.
+    // Layout first: it may re-render at a new width, and everything below
+    // reads the result.
     app.set_viewport(content.width as usize, content.height as usize);
 
     frame.render_widget(block, main);
     frame.render_widget(Paragraph::new(app.visible_lines().to_vec()), content);
 
     if app.max_scroll() > 0 {
-        // content_length counts scroll *positions*, so the thumb touches the
+        // content_length counts scroll *positions*, so the thumb reaches the
         // bottom of the track exactly when the last line is on screen.
         let mut state = ScrollbarState::new(app.max_scroll() + 1)
             .position(app.scroll)
@@ -80,12 +82,15 @@ fn status_line(app: &App, frame: &mut Frame, area: Rect) {
             // Show as many whole hints as fit, rather than cutting one off mid-word.
             let mut line = Line::from(" ");
             for (key, action) in HINTS {
-                let action = format!(" {action}  ");
-                if line.width() + key.len() + action.trim_end().len() > room {
+                let key = Span::styled(key, theme::status_key());
+                let action = Span::styled(format!(" {action}  "), theme::status());
+                // The gap after the last hint may be clipped; the hint may not.
+                let needed = key.width() + action.content.trim_end().width();
+                if line.width() + needed > room {
                     break;
                 }
-                line.push_span(Span::styled(key, theme::status_key()));
-                line.push_span(Span::styled(action, theme::status()));
+                line.push_span(key);
+                line.push_span(action);
             }
             line
         }
@@ -108,7 +113,8 @@ fn position(app: &App) -> String {
         return "empty".into();
     }
     let first = app.scroll + 1;
-    let last = (app.scroll + app.viewport_height).min(total);
+    // A viewport too short to show anything still reports a sane range.
+    let last = (app.scroll + app.viewport_height.max(1)).min(total);
     let max = app.max_scroll();
     let where_ = if max == 0 {
         "All".to_string()

@@ -29,8 +29,8 @@ pub struct App {
     /// Index of the first visible line.
     pub scroll: usize,
     pub viewport_height: usize,
-    /// Width `lines` was rendered at; 0 until the first frame is laid out.
-    render_width: usize,
+    /// Width `lines` was rendered at, or `None` until the first frame is laid out.
+    render_width: Option<usize>,
     pub message: Option<Message>,
 }
 
@@ -43,12 +43,12 @@ impl App {
             lines: Vec::new(),
             scroll: 0,
             viewport_height: 0,
-            render_width: 0,
+            render_width: None,
             message: None,
         }
     }
 
-    /// Handles the tick event of the terminal: expires the status message.
+    /// Expires the status message once it has been up long enough.
     pub fn tick(&mut self) {
         if self
             .message
@@ -59,7 +59,6 @@ impl App {
         }
     }
 
-    /// Set should_quit to true to quit the application.
     pub fn quit(&mut self) {
         self.should_quit = true;
     }
@@ -72,11 +71,11 @@ impl App {
             .unwrap_or(&self.md_filepath)
     }
 
-    /// Tells the app how much room it has. Called every frame by the UI; only
-    /// re-renders when the width actually changed (i.e. on a resize).
+    /// Tells the app how much room it has. Called every frame, but only
+    /// re-renders when the width changed — that is, on a resize.
     pub fn set_viewport(&mut self, width: usize, height: usize) {
-        if width != self.render_width {
-            self.render_width = width;
+        if self.render_width != Some(width) {
+            self.render_width = Some(width);
             self.lines = render_ast(&self.source, width);
         }
         self.viewport_height = height;
@@ -86,8 +85,8 @@ impl App {
     /// Swaps in new Markdown source, keeping the scroll position where possible.
     pub fn reload(&mut self, source: String) {
         self.source = source;
-        if self.render_width > 0 {
-            self.lines = render_ast(&self.source, self.render_width);
+        if let Some(width) = self.render_width {
+            self.lines = render_ast(&self.source, width);
         }
         self.clamp_scroll();
         self.notify("reloaded", false);

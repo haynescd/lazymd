@@ -1,18 +1,26 @@
-use std::{
-    env::{self},
-    process,
-};
+use std::{env, process};
 
-use codon::{Config, run};
+use codon::{Command, USAGE, parse_args, run};
 
 fn main() {
     let args: Vec<String> = env::args().collect();
 
-    let config = Config::build(&args).unwrap_or_else(|err| {
-        eprintln!("Problem parsing args: {err}");
-        eprintln!("usage: codon <file.md>");
-        process::exit(1);
-    });
+    let config = match parse_args(&args) {
+        Ok(Command::Run(config)) => config,
+        Ok(Command::Help) => {
+            print!("{USAGE}");
+            return;
+        }
+        Ok(Command::Version) => {
+            println!("codon {}", env!("CARGO_PKG_VERSION"));
+            return;
+        }
+        Err(err) => {
+            eprintln!("codon: {err}");
+            eprintln!("Try 'codon --help' for more information.");
+            process::exit(2);
+        }
+    };
 
     if let Err(err) = run(config) {
         eprintln!("codon: {err}");

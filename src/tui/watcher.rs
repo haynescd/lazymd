@@ -17,14 +17,12 @@ impl MdWatcher {
     pub fn new(md_filepath: String) -> Self {
         let (watch_tx, watch_rx) = mpsc::channel::<()>();
 
-        // Editors typically save by writing a temp file and renaming it over the
-        // original, which replaces the file's inode. Compare against the canonical
-        // path so a directory-level watch still recognizes it after that swap.
+        // An editor's save replaces the file's inode, so compare canonical paths
+        // rather than anything the old file held.
         let target: PathBuf =
             std::fs::canonicalize(&md_filepath).unwrap_or_else(|_| PathBuf::from(&md_filepath));
 
-        // notify hands the closure a `notify::Result<notify::Event>`; a directory
-        // watch reports events for every entry inside it, so filter down to ours.
+        // A directory watch reports every entry inside it, so filter down to ours.
         let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
             let event = match res {
                 Ok(event) => event,

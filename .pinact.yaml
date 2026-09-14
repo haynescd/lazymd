@@ -1,0 +1,13 @@
+# pinact config, used by .github/workflows/gha-lint.yml.
+# https://github.com/suzuki-shunsuke/pinact/blob/main/docs/config.md
+version: 3
+
+rules:
+  # dist generates release.yml from the SHAs in dist-workspace.toml
+  # ([dist.github-action-commits]) but writes them without a `# vX.Y.Z`
+  # comment, and hand-editing release.yml breaks dist's own CI check. Those
+  # lines are already hash-pinned, so let a bare full-length SHA through.
+  - ignore: true
+    conditions:
+      - expr: |
+          VersionComment == "" && ActionVersion matches "^[0-9a-f]{40}$"

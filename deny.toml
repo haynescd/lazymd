@@ -1,0 +1,30 @@
+# cargo-deny config, run by .github/workflows/audit.yml.
+# https://embarkstudios.github.io/cargo-deny/checks/cfg.html
+
+[advisories]
+ignore = []
+
+[licenses]
+# Everything the current dependency tree needs. Anything new has to be added
+# here on purpose.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",     # comrak
+    "ISC",              # inotify
+    "Zlib",             # foldhash, zlib-rs
+    "CC0-1.0",          # notify
+    "WTFPL",            # terminfo
+    "Unicode-3.0",      # unicode-ident
+    "Unicode-DFS-2016", # wezterm-bidi
+]
+confidence-threshold = 0.8
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

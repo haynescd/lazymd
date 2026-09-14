@@ -2,6 +2,14 @@
 name = "codon"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.88"
+description = "A fast terminal Markdown previewer with live reload"
+license = "MIT"
+repository = "https://github.com/haynescd/codon"
+homepage = "https://github.com/haynescd/codon"
+readme = "README.md"
+keywords = ["markdown", "tui", "terminal", "preview", "cli"]
+categories = ["command-line-utilities", "text-processing"]
 
 [dependencies]
 anyhow = "1.0.104"
@@ -12,4 +20,15 @@ notify = "8.2.0"
 ratatui = "0.30.2"
 simplelog = "0.12.2"
 syntect = { version = "5.3.0", default-features = false, features = ["default-fancy"] }
+unicode-segmentation = "1.12"
 unicode-width = "0.2"
+
+[profile.release]
+codegen-units = 1 # Allows compiler to perform better optimization.
+lto = true # Enables Link-time Optimization.
+opt-level = 3 # Prioritizes speed. Use `"z"` if you prefer small binary size.
+strip = true # Ensures debug symbols are removed.
+
+# The profile cargo-dist builds release artifacts with.
+[profile.dist]
+inherits = "release"
