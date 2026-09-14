@@ -8,7 +8,7 @@ use anyhow::Result;
 use crossterm::event;
 use ratatui::crossterm::event::{Event as CrosstermEvent, KeyEvent, MouseEvent};
 
-use crate::watcher::MdWatcher;
+use crate::tui::watcher::MdWatcher;
 /// Anything the main loop might wake up for.
 #[derive(Clone, Copy, Debug)]
 pub enum Event {

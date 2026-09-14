@@ -5,19 +5,16 @@ use ratatui::{Terminal, backend::CrosstermBackend};
 
 use crate::{
     app::App,
-    event::{Event, EventHandler},
     tui::Tui,
-    watcher::MdWatcher,
+    tui::event::{Event, EventHandler},
+    tui::watcher::MdWatcher,
 };
 
 pub mod app;
-pub mod event;
 pub mod logging;
 pub mod render;
 pub mod theme;
 pub mod tui;
-pub mod ui;
-pub mod watcher;
 
 /// Lines moved per mouse-wheel notch.
 const WHEEL_STEP: usize = 3;

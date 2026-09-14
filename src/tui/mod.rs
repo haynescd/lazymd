@@ -9,7 +9,14 @@ use ratatui::crossterm::{
 
 pub type CrosstermTerminal = ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stderr>>;
 
-use crate::{app::App, event::EventHandler, ui};
+use crate::app::App;
+
+use crate::tui::event::EventHandler;
+
+pub mod event;
+pub mod ui;
+pub mod watcher;
+
 /// Owns the terminal: raw mode, the alternate screen, and the draw loop.
 pub struct Tui {
     terminal: CrosstermTerminal,
