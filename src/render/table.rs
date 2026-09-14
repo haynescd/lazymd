@@ -9,7 +9,9 @@ use comrak::nodes::{AstNode, NodeValue, TableAlignment};
 use ratatui::{style::Style, text::Span};
 
 use super::inline;
-use crate::{theme, wrap};
+use crate::theme;
+
+use crate::render::wrap;
 
 /// Narrowest a column may be squeezed to.
 const MIN_COLUMN_WIDTH: usize = 3;

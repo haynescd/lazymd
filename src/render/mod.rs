@@ -28,10 +28,12 @@ use ratatui::{
     text::{Line, Span},
 };
 
-use crate::{highlight, theme, wrap};
+use crate::theme;
 
+mod highlight;
 mod inline;
 mod table;
+mod wrap;
 
 /// Narrowest width we'll wrap text to. If nesting eats more of the screen than
 /// this, lines overflow and get clipped rather than collapsing to a letter per row.

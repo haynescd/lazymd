@@ -12,14 +12,12 @@ use crate::{
 
 pub mod app;
 pub mod event;
-pub mod highlight;
 pub mod logging;
 pub mod render;
 pub mod theme;
 pub mod tui;
 pub mod ui;
 pub mod watcher;
-pub mod wrap;
 
 /// Lines moved per mouse-wheel notch.
 const WHEEL_STEP: usize = 3;
