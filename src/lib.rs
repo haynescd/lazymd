@@ -2,6 +2,7 @@ use std::{error::Error, fs};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use ratatui::{Terminal, backend::CrosstermBackend};
+use ratatui_image::picker::Picker;
 
 use crate::{
     app::App,
@@ -93,8 +94,15 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
     let contents =
         fs::read_to_string(&file_path).map_err(|e| format!("couldn't read {file_path}: {e}"))?;
 
+    // Ask the terminal how it draws images and how big its cells are. This
+    // reads replies from stdin, so it has to finish before the event thread starts.
+    let picker = Picker::from_query_stdio().unwrap_or_else(|e| {
+        log::warn!("couldn't query terminal graphics, using halfblocks: {e}");
+        Picker::halfblocks()
+    });
+
     // Rendering waits for the first frame, when the terminal width is known.
-    let mut app = App::new(file_path.clone(), contents);
+    let mut app = App::new(file_path.clone(), contents, Some(picker));
 
     let watcher = MdWatcher::new(file_path.clone());
     let backend = CrosstermBackend::new(std::io::stderr());
