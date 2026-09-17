@@ -1,14 +1,15 @@
 use std::{
+    collections::{HashMap, hash_map::Entry},
     path::Path,
     time::{Duration, Instant},
 };
 
 use ratatui::text::Line;
-use ratatui_image::{picker::Picker, sliced::SlicedProtocol};
+use ratatui_image::{picker::Picker, protocol, sliced::SlicedProtocol};
 
 use crate::render::{
     RenderElement,
-    image::{Image, ImageLoader},
+    image::{Image, ImageKey, ImageLoader},
     render_ast,
 };
 
@@ -28,7 +29,8 @@ pub struct Message {
 #[derive(Debug)]
 pub struct PlacedImage {
     pub row: usize,
-    pub image: Image,
+    pub height: usize,
+    pub image: ImageKey,
 }
 
 pub struct App {
@@ -43,6 +45,8 @@ pub struct App {
     pub images: Vec<PlacedImage>,
     /// `None` shows images as their alt text (tests, or a terminal we couldn't query).
     image_loader: Option<ImageLoader>,
+    image_cache: HashMap<ImageKey, Image>,
+
     /// Index of the first visible line.
     pub scroll: usize,
     pub viewport_height: usize,
@@ -61,6 +65,7 @@ impl App {
             lines: Vec::new(),
             images: Vec::new(),
             image_loader,
+            image_cache: HashMap::new(),
             scroll: 0,
             viewport_height: 0,
             render_width: None,
@@ -112,12 +117,29 @@ impl App {
         for element in elements {
             match element {
                 RenderElement::Lines(lines) => self.lines.extend(lines),
-                RenderElement::Image(image) => {
+                RenderElement::Image(id) => {
+                    let protocol = match self.image_cache.entry(id.key.clone()) {
+                        Entry::Occupied(e) => Some(e.into_mut()),
+                        Entry::Vacant(e) => self
+                            .image_loader
+                            .as_ref()
+                            .and_then(|l| l.load(id.key.clone(), id.width))
+                            .map(|image| e.insert(image)),
+                    };
+
+                    let Some(protocol) = protocol else {
+                        continue;
+                    };
+
                     let row = self.lines.len();
-                    let height = usize::from(image.height);
+                    let height = usize::from(protocol.height);
                     self.lines
                         .extend(std::iter::repeat_n(Line::default(), height));
-                    self.images.push(PlacedImage { row, image });
+                    self.images.push(PlacedImage {
+                        row,
+                        height,
+                        image: id.key,
+                    });
                 }
             }
         }
@@ -157,11 +179,16 @@ impl App {
     /// starts on — negative when its top has scrolled off.
     pub fn visible_images(&self) -> impl Iterator<Item = (&SlicedProtocol, i16)> {
         let (top, bottom) = (self.scroll, self.scroll + self.viewport_height);
+        let cache = &self.image_cache;
         self.images
             .iter()
-            .filter(move |p| p.row < bottom && p.row + usize::from(p.image.height) > top)
+            .filter(move |p| p.row < bottom && p.row + usize::from(p.height) > top)
+            .filter_map(move |p| {
+                let image = cache.get(&p.image)?; // ImageKey -> &Image, skip on miss
+                Some((&image.protocol, (p.row as i64 - top as i64) as i16))
+            })
             // In range, so the offset is within ± one image or viewport height.
-            .map(move |p| (&p.image.protocol, (p.row as i64 - top as i64) as i16))
+            .map(move |(p, row)| (p, (row as i64 - top as i64) as i16))
     }
 
     pub fn scroll_down(&mut self, n: usize) {
@@ -216,24 +243,43 @@ mod tests {
         app
     }
 
+    /// A scratch directory for one test, deleted when dropped — even if the
+    /// test panics.
+    struct TestDir(std::path::PathBuf);
+
+    impl TestDir {
+        fn new() -> Self {
+            // Tests run in parallel, so each call gets its own directory.
+            static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let call = CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let dir =
+                std::env::temp_dir().join(format!("lazymd-test-{}-{call}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            TestDir(dir)
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     /// An app whose document is one line, an image `rows` terminal rows tall
-    /// (at halfblocks' 10x20 cells), and 30 more lines.
-    fn app_with_image(rows: u32) -> App {
-        // Tests run in parallel, so each call gets its own directory.
-        static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        let call = CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("lazymd-test-{}-{call}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+    /// (at halfblocks' 10x20 cells), and 30 more lines. Keep the `TestDir`
+    /// alive for as long as the app might reload the image.
+    fn app_with_image(rows: u32) -> (App, TestDir) {
+        let dir = TestDir::new();
         image::RgbImage::new(10, rows * 20)
-            .save(dir.join("pic.png"))
+            .save(dir.0.join("pic.png"))
             .unwrap();
 
         let tail: String = (0..30).map(|i| format!("\n\nline {i}")).collect();
         let source = format!("top\n\n![pic](pic.png){tail}");
-        let md_path = dir.join("doc.md").to_string_lossy().into_owned();
+        let md_path = dir.0.join("doc.md").to_string_lossy().into_owned();
         let mut app = App::new(md_path, source, Some(Picker::halfblocks()));
         app.set_viewport(40, 10);
-        app
+        (app, dir)
     }
 
     #[test]
@@ -297,7 +343,7 @@ mod tests {
     /// An image takes blank placeholder rows, so scrolling counts it like text.
     #[test]
     fn image_reserves_its_rows() {
-        let app = app_with_image(4);
+        let (app, _dir) = app_with_image(4);
         assert_eq!(app.images.len(), 1);
         // "top", a blank separator, then the image.
         assert_eq!(app.images[0].row, 2);
@@ -309,7 +355,7 @@ mod tests {
 
     #[test]
     fn visible_images_track_the_scroll() {
-        let mut app = app_with_image(4);
+        let (mut app, _dir) = app_with_image(4);
         let offsets = |app: &App| app.visible_images().map(|(_, y)| y).collect::<Vec<_>>();
         assert_eq!(offsets(&app), [2]);
         app.scroll_down(3);

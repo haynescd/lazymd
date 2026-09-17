@@ -15,7 +15,7 @@
 //! to the whole document. `Renderer` changes the `Canvas` only through its
 //! methods, never by touching its fields.
 
-use std::sync::LazyLock;
+use std::{path::Path, sync::LazyLock};
 
 use comrak::{
     Arena, Options,
@@ -28,7 +28,7 @@ use ratatui::{
     text::{Line, Span},
 };
 
-use crate::theme;
+use crate::{render::image::ImageResolver, theme};
 
 use image::ImageLoader;
 
@@ -182,7 +182,7 @@ pub enum RenderElement {
     /// A run of text rows.
     Lines(Vec<Line<'static>>),
     /// An image with its protocol and terminal height.
-    Image(image::Image),
+    Image(image::ImageDescriptor),
 }
 
 /// The rendered document, and everything needed to place one more line in it.
@@ -295,7 +295,7 @@ impl Canvas {
 
     /// Emits an image. It sits outside the prefix system — the image renders
     /// into its own area, not behind any container prefix.
-    fn push_image(&mut self, img: image::Image) {
+    fn push_image(&mut self, img: image::ImageDescriptor) {
         self.elements.push(RenderElement::Image(img));
         self.needs_separator = true;
     }
@@ -319,16 +319,17 @@ struct Ctx {
 }
 
 #[derive(Debug)]
-struct Renderer<'img> {
+struct Renderer {
     canvas: Canvas,
     /// Footnote definitions share one divider, drawn before the first of them.
     footnotes_started: bool,
     /// Without a loader, images show as their alt text.
-    images: Option<&'img ImageLoader>,
+    images: ImageResolver,
 }
 
-impl<'img> Renderer<'img> {
-    fn new(width: usize, images: Option<&'img ImageLoader>) -> Self {
+impl Renderer {
+    fn new(width: usize, md_filepath: String) -> Self {
+        let images = ImageResolver::new(Path::new(&md_filepath));
         Renderer {
             canvas: Canvas::new(width),
             footnotes_started: false,
@@ -566,12 +567,10 @@ impl<'img> Renderer<'img> {
     fn image(&mut self, url: &str, alt: &str, ctx: Ctx) {
         self.separate(ctx);
         let width = self.canvas.content_width();
-        match self.images.and_then(|loader| loader.load(url, width)) {
+        match self.images.resolve(url, width) {
             Some(image) => self.canvas.push_image(image),
             None => {
-                if self.images.is_some() {
-                    log::warn!("couldn't load image {url:?}");
-                }
+                log::warn!("couldn't load image {url:?}");
                 self.canvas
                     .push_line(vec![inline::image_label(alt, ctx.base_style)]);
             }
@@ -620,10 +619,11 @@ static OPTIONS: LazyLock<Options<'static>> = LazyLock::new(|| Options {
 /// Parses `md` and renders it to elements (text lines + images) that fit in
 /// `width` columns. Without an image loader, images show as their alt text.
 pub fn render_ast(md: &str, width: usize, images: Option<&ImageLoader>) -> Vec<RenderElement> {
+    let md_path = md.to_string();
     let arena = Arena::new();
     let root = parse_document(&arena, md, &OPTIONS);
 
-    let mut renderer = Renderer::new(width, images);
+    let mut renderer = Renderer::new(width, md_path.to_string());
     renderer.block(root, Ctx::default());
 
     renderer.canvas.into_elements()
