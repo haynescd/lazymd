@@ -1,23 +1,17 @@
-use std::{env, fs, path::PathBuf, str::FromStr};
+use std::{env, fs, path::PathBuf};
 
-use anyhow::{Context, anyhow};
+use anyhow::Context;
 use log::LevelFilter;
 use simplelog::{Config, WriteLogger};
 
-/// Sets up file-based logging for the TUI.
+/// Sets up file-based logging for the TUI at `level`.
 ///
 /// The TUI owns the terminal, so `println!` output is overwritten by the next
 /// redraw before anyone sees it. Everything goes to `lazymd.log` in the user's
 /// state directory instead (see [`log_dir`]), truncated on each launch so it
-/// only ever holds the latest session. `LAZYMD_LOG` picks the level (`off`,
-/// `error`, `warn`, `info`, `debug`, `trace`; default `info`), and `log::info!`
-/// and friends work crate-wide once this has run.
-pub fn init() -> anyhow::Result<()> {
-    let level = match env::var("LAZYMD_LOG") {
-        Ok(value) => LevelFilter::from_str(&value)
-            .map_err(|_| anyhow!("LAZYMD_LOG={value} isn't a log level"))?,
-        Err(_) => LevelFilter::Info,
-    };
+/// only ever holds the latest session. `log::info!` and friends work crate-wide
+/// once this has run.
+pub fn init(level: LevelFilter) -> anyhow::Result<()> {
     if level == LevelFilter::Off {
         return Ok(());
     }
