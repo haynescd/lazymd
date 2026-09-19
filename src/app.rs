@@ -384,7 +384,11 @@ mod tests {
             .save(dir.0.join("pic.png"))
             .unwrap();
         let md_path = dir.0.join("doc.md").to_string_lossy().into_owned();
-        let mut app = App::new(md_path, "![pic](pic.png)".into(), Some(Picker::halfblocks()));
+        let mut app = App::new(
+            md_path,
+            "![pic](pic.png)".into(),
+            Some(Picker::halfblocks()),
+        );
 
         app.set_viewport(40, 10);
         assert_eq!(app.images[0].height, 40);
