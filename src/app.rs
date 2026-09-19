@@ -1,16 +1,16 @@
 use std::{
-    collections::{HashMap, hash_map::Entry},
+    collections::HashMap,
     path::Path,
     time::{Duration, Instant},
 };
 
-use ratatui::text::Line;
-use ratatui_image::{picker::Picker, protocol, sliced::SlicedProtocol};
+use ratatui::{style::Style, text::Line};
+use ratatui_image::{picker::Picker, sliced::SlicedProtocol};
 
 use crate::render::{
     RenderElement,
-    image::{Image, ImageKey, ImageLoader},
-    render_ast,
+    image::{Image, ImageDescriptor, ImageLoader, ImageResolver},
+    inline, render_ast,
 };
 
 /// How long a status-line message stays up.
@@ -30,7 +30,7 @@ pub struct Message {
 pub struct PlacedImage {
     pub row: usize,
     pub height: usize,
-    pub image: ImageKey,
+    pub image: ImageDescriptor,
 }
 
 pub struct App {
@@ -43,9 +43,16 @@ pub struct App {
     pub lines: Vec<Line<'static>>,
     /// The images to draw over their placeholder rows, in document order.
     pub images: Vec<PlacedImage>,
-    /// `None` shows images as their alt text (tests, or a terminal we couldn't query).
+    /// `None` shows images as their alt text (tests, or a terminal we couldn't
+    /// query). The two are set together: there's no point resolving an image we
+    /// have no way to draw.
+    image_resolver: Option<ImageResolver>,
     image_loader: Option<ImageLoader>,
-    image_cache: HashMap<ImageKey, Image>,
+    /// Decoded images, keyed by file *and* width: a resize needs a new size, so
+    /// it needs a new entry. `None` remembers one that wouldn't decode, so we
+    /// don't try it again on every rebuild. Rebuilding drops whatever the new
+    /// document and width no longer use.
+    image_cache: HashMap<ImageDescriptor, Option<Image>>,
 
     /// Index of the first visible line.
     pub scroll: usize,
@@ -57,13 +64,21 @@ pub struct App {
 
 impl App {
     pub fn new(md_filepath: String, source: String, picker: Option<Picker>) -> Self {
-        let image_loader = picker.map(|p| ImageLoader::new(p, Path::new(&md_filepath)));
+        let (image_resolver, image_loader) = picker
+            .map(|p| {
+                (
+                    ImageResolver::new(Path::new(&md_filepath)),
+                    ImageLoader::new(p),
+                )
+            })
+            .unzip();
         App {
             should_quit: false,
             md_filepath,
             source,
             lines: Vec::new(),
             images: Vec::new(),
+            image_resolver,
             image_loader,
             image_cache: HashMap::new(),
             scroll: 0,
@@ -110,39 +125,46 @@ impl App {
     /// Re-renders the source at the current width.
     fn rebuild(&mut self) {
         let width = self.render_width.unwrap_or(80);
-        let elements = render_ast(&self.source, width, self.image_loader.as_ref());
+        let elements = render_ast(&self.source, width, self.image_resolver.as_ref());
 
         self.lines.clear();
         self.images.clear();
+        // Entries move over from the old cache as they're used, so what the new
+        // document and width don't need is dropped with `old` at the end.
+        let mut old = std::mem::take(&mut self.image_cache);
         for element in elements {
             match element {
                 RenderElement::Lines(lines) => self.lines.extend(lines),
                 RenderElement::Image(id) => {
-                    let protocol = match self.image_cache.entry(id.key.clone()) {
-                        Entry::Occupied(e) => Some(e.into_mut()),
-                        Entry::Vacant(e) => self
-                            .image_loader
-                            .as_ref()
-                            .and_then(|l| l.load(id.key.clone(), id.width))
-                            .map(|image| e.insert(image)),
-                    };
+                    let image = self.image_cache.entry(id.clone()).or_insert_with(|| {
+                        old.remove(&id).unwrap_or_else(|| {
+                            self.image_loader
+                                .as_ref()
+                                .and_then(|l| l.load(id.key.clone(), id.width))
+                        })
+                    });
 
-                    let Some(protocol) = protocol else {
+                    // Resolved but wouldn't decode: show the alt text rather
+                    // than dropping the image from the document entirely.
+                    let Some(image) = image else {
+                        self.lines
+                            .push(Line::from(inline::image_label(&id.alt, Style::default())));
                         continue;
                     };
 
                     let row = self.lines.len();
-                    let height = usize::from(protocol.height);
+                    let height = usize::from(image.height);
                     self.lines
                         .extend(std::iter::repeat_n(Line::default(), height));
                     self.images.push(PlacedImage {
                         row,
                         height,
-                        image: id.key,
+                        image: id,
                     });
                 }
             }
         }
+        log::trace!("{} images cached after rebuild", self.image_cache.len());
     }
 
     /// Swaps in new Markdown source, keeping the scroll position where possible.
@@ -182,13 +204,12 @@ impl App {
         let cache = &self.image_cache;
         self.images
             .iter()
-            .filter(move |p| p.row < bottom && p.row + usize::from(p.height) > top)
+            .filter(move |p| p.row < bottom && p.row + p.height > top)
             .filter_map(move |p| {
-                let image = cache.get(&p.image)?; // ImageKey -> &Image, skip on miss
+                let image = cache.get(&p.image)?.as_ref()?; // skip on miss
+                // In range, so the offset is within ± one image or viewport height.
                 Some((&image.protocol, (p.row as i64 - top as i64) as i16))
             })
-            // In range, so the offset is within ± one image or viewport height.
-            .map(move |(p, row)| (p, (row as i64 - top as i64) as i16))
     }
 
     pub fn scroll_down(&mut self, n: usize) {
@@ -347,10 +368,31 @@ mod tests {
         assert_eq!(app.images.len(), 1);
         // "top", a blank separator, then the image.
         assert_eq!(app.images[0].row, 2);
-        assert_eq!(app.images[0].image.height, 4);
+        assert_eq!(app.images[0].height, 4);
         assert!(app.lines[2..6].iter().all(|l| l.width() == 0));
         // Then 30 lines, each after a blank separator.
         assert_eq!(app.lines.len(), 6 + 60);
+    }
+
+    /// A narrower viewport scales the image down, so the cached copy — sized
+    /// for the old width — must not be reused.
+    #[test]
+    fn resizing_re_sizes_the_image() {
+        let dir = TestDir::new();
+        // 40 cells wide at halfblocks' 10x20, so it has room to shrink.
+        image::RgbImage::new(400, 800)
+            .save(dir.0.join("pic.png"))
+            .unwrap();
+        let md_path = dir.0.join("doc.md").to_string_lossy().into_owned();
+        let mut app = App::new(md_path, "![pic](pic.png)".into(), Some(Picker::halfblocks()));
+
+        app.set_viewport(40, 10);
+        assert_eq!(app.images[0].height, 40);
+
+        app.set_viewport(20, 10);
+        assert_eq!(app.images[0].height, 20);
+        // The 40-column entry is dropped rather than kept forever.
+        assert_eq!(app.image_cache.len(), 1);
     }
 
     #[test]

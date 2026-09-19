@@ -15,7 +15,7 @@
 //! to the whole document. `Renderer` changes the `Canvas` only through its
 //! methods, never by touching its fields.
 
-use std::{path::Path, sync::LazyLock};
+use std::sync::LazyLock;
 
 use comrak::{
     Arena, Options,
@@ -28,13 +28,13 @@ use ratatui::{
     text::{Line, Span},
 };
 
-use crate::{render::image::ImageResolver, theme};
+use crate::theme;
 
-use image::ImageLoader;
+use image::ImageResolver;
 
 mod highlight;
 pub mod image;
-mod inline;
+pub(crate) mod inline;
 mod table;
 mod wrap;
 
@@ -319,17 +319,18 @@ struct Ctx {
 }
 
 #[derive(Debug)]
-struct Renderer {
+struct Renderer<'img> {
     canvas: Canvas,
     /// Footnote definitions share one divider, drawn before the first of them.
     footnotes_started: bool,
-    /// Without a loader, images show as their alt text.
-    images: ImageResolver,
+    /// Without a resolver, images show as their alt text.
+    images: Option<&'img ImageResolver>,
 }
 
-impl Renderer {
-    fn new(width: usize, md_filepath: String) -> Self {
-        let images = ImageResolver::new(Path::new(&md_filepath));
+// The lifetime is `'img`, not `'a`: the block methods below each bind their own
+// `'a` to the AST arena, which a struct lifetime of that name would shadow.
+impl<'img> Renderer<'img> {
+    fn new(width: usize, images: Option<&'img ImageResolver>) -> Self {
         Renderer {
             canvas: Canvas::new(width),
             footnotes_started: false,
@@ -567,7 +568,7 @@ impl Renderer {
     fn image(&mut self, url: &str, alt: &str, ctx: Ctx) {
         self.separate(ctx);
         let width = self.canvas.content_width();
-        match self.images.resolve(url, width) {
+        match self.images.and_then(|r| r.resolve(url, width, alt)) {
             Some(image) => self.canvas.push_image(image),
             None => {
                 log::warn!("couldn't load image {url:?}");
@@ -617,13 +618,12 @@ static OPTIONS: LazyLock<Options<'static>> = LazyLock::new(|| Options {
 });
 
 /// Parses `md` and renders it to elements (text lines + images) that fit in
-/// `width` columns. Without an image loader, images show as their alt text.
-pub fn render_ast(md: &str, width: usize, images: Option<&ImageLoader>) -> Vec<RenderElement> {
-    let md_path = md.to_string();
+/// `width` columns. Without a resolver, images show as their alt text.
+pub fn render_ast(md: &str, width: usize, images: Option<&ImageResolver>) -> Vec<RenderElement> {
     let arena = Arena::new();
     let root = parse_document(&arena, md, &OPTIONS);
 
-    let mut renderer = Renderer::new(width, md_path.to_string());
+    let mut renderer = Renderer::new(width, images);
     renderer.block(root, Ctx::default());
 
     renderer.canvas.into_elements()
@@ -989,14 +989,11 @@ mod tests {
         assert_eq!(render("![a cat](cat.png)"), ["[image: a cat]"]);
     }
 
-    /// A loader that can't find the file falls back to the alt text, not the url.
+    /// A resolver that can't find the file falls back to the alt text, not the url.
     #[test]
     fn missing_image_falls_back_to_alt_text() {
-        let loader = ImageLoader::new(
-            ratatui_image::picker::Picker::halfblocks(),
-            std::path::Path::new("no/such/dir/doc.md"),
-        );
-        let out = text_lines(render_ast("![a cat](cat.png)", 40, Some(&loader)));
+        let resolver = ImageResolver::new(std::path::Path::new("no/such/dir/doc.md"));
+        let out = text_lines(render_ast("![a cat](cat.png)", 40, Some(&resolver)));
         assert_eq!(plain(&out), ["[image: a cat]"]);
     }
 

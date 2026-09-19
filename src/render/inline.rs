@@ -27,7 +27,7 @@ pub(super) fn alt_text<'a>(n: &'a AstNode<'a>) -> String {
 }
 
 /// What an image shows when it can't be drawn: its alt text, marked as an image.
-pub(super) fn image_label(alt: &str, style: Style) -> Span<'static> {
+pub(crate) fn image_label(alt: &str, style: Style) -> Span<'static> {
     let label = if alt.is_empty() {
         "[image]".to_string()
     } else {
