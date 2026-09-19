@@ -1,6 +1,8 @@
-use std::{error::Error, fs};
+use std::{error::Error, fs, path::PathBuf, str::FromStr};
 
+use clap::Parser;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
+use log::LevelFilter;
 use ratatui::{Terminal, backend::CrosstermBackend};
 use ratatui_image::picker::Picker;
 
@@ -20,18 +22,7 @@ pub mod tui;
 /// Lines moved per mouse-wheel notch.
 const WHEEL_STEP: usize = 3;
 
-pub const USAGE: &str = "\
-lazymd - a terminal Markdown previewer with live reload
-
-Usage: lazymd [OPTIONS] <FILE>
-
-Options:
-  -h, --help       Print this help
-  -V, --version    Print the version
-
-Environment:
-  LAZYMD_LOG       Log level: off, error, warn, info (default), debug, trace
-
+const KEYS_HELP: &str = "\
 Keys:
   q, Esc, Ctrl-c   Quit
   j, k             Scroll down / up
@@ -41,55 +32,44 @@ Keys:
   r                Reload now
 ";
 
-/// What the command line asked for.
-#[derive(Debug, PartialEq)]
-pub enum Command {
-    Run(Config),
-    Help,
-    Version,
+#[derive(Parser, Debug)]
+#[command(
+    version,
+    about = "A terminal Markdown previewer with live reload.",
+    after_help = KEYS_HELP
+)]
+pub struct Args {
+    /// Markdown file to preview.
+    pub md_file: PathBuf,
+
+    /// How much is written to the log file.
+    #[arg(
+        long,
+        env = "LAZYMD_LOG",
+        default_value = "info",
+        value_name = "LEVEL",
+        value_parser = parse_log_level,
+    )]
+    pub log_level: LevelFilter,
 }
 
-#[derive(Debug, PartialEq)]
-pub struct Config {
-    pub file_path: String,
+/// `LevelFilter`'s own parse error doesn't list the levels, so spell them out.
+fn parse_log_level(value: &str) -> Result<LevelFilter, String> {
+    LevelFilter::from_str(value)
+        .map_err(|_| "expected one of: off, error, warn, info, debug, trace".to_string())
 }
 
-/// Parses the command line, `args[0]` being the program name.
-///
-/// `--` ends option parsing, so `lazymd -- -notes.md` opens a file whose name
-/// starts with a dash.
-pub fn parse_args(args: &[String]) -> Result<Command, String> {
-    let mut files = Vec::new();
-    let mut options_done = false;
-    for arg in args.iter().skip(1) {
-        match arg.as_str() {
-            _ if options_done => files.push(arg),
-            "-h" | "--help" => return Ok(Command::Help),
-            "-V" | "--version" => return Ok(Command::Version),
-            "--" => options_done = true,
-            opt if opt.starts_with('-') => return Err(format!("unknown option: {opt}")),
-            _ => files.push(arg),
-        }
-    }
-
-    match files.as_slice() {
-        [file] => Ok(Command::Run(Config {
-            file_path: file.to_string(),
-        })),
-        [] => Err("no file given".to_string()),
-        _ => Err(format!("expected one file, got {}", files.len())),
-    }
-}
-
-pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
+pub fn run(args: Args) -> Result<(), Box<dyn Error>> {
     // Logs are a debugging aid; lazymd runs fine without them. This lands on the
     // main screen, so it's still there once the TUI exits.
-    if let Err(e) = logging::init() {
+    if let Err(e) = logging::init(args.log_level) {
         eprintln!("lazymd: logging disabled: {e}");
     }
-    log::info!("lazymd starting for {}", config.file_path);
 
-    let file_path = config.file_path.clone();
+    // App and the watcher both want a displayable path, not an OS string.
+    let file_path = args.md_file.to_string_lossy().into_owned();
+    log::info!("lazymd starting for {file_path}");
+
     // Read before touching the terminal, so a bad path is a plain error message.
     let contents =
         fs::read_to_string(&file_path).map_err(|e| format!("couldn't read {file_path}: {e}"))?;
@@ -176,62 +156,63 @@ fn handle_mouse_event(mouse_event: MouseEvent, app: &mut App) {
 mod tests {
     use super::*;
 
-    fn parse(args: &[&str]) -> Result<Command, String> {
-        let args: Vec<String> = std::iter::once("lazymd")
-            .chain(args.iter().copied())
-            .map(String::from)
-            .collect();
-        parse_args(&args)
+    use clap::CommandFactory;
+
+    fn parse(args: &[&str]) -> Result<Args, clap::Error> {
+        Args::try_parse_from(std::iter::once("lazymd").chain(args.iter().copied()))
     }
 
-    fn run_cmd(file_path: &str) -> Result<Command, String> {
-        Ok(Command::Run(Config {
-            file_path: file_path.to_string(),
-        }))
+    #[test]
+    fn cli_is_well_formed() {
+        Args::command().debug_assert();
     }
 
     #[test]
     fn one_file_runs() {
-        assert_eq!(parse(&["notes.md"]), run_cmd("notes.md"));
+        // No assertion on `log_level`: it reads `LAZYMD_LOG` from the real
+        // environment, so its default isn't ours to pin down here.
+        assert_eq!(
+            parse(&["notes.md"]).unwrap().md_file,
+            PathBuf::from("notes.md")
+        );
     }
 
     #[test]
-    fn help_and_version_flags() {
-        assert_eq!(parse(&["-h"]), Ok(Command::Help));
-        assert_eq!(parse(&["--help"]), Ok(Command::Help));
-        assert_eq!(parse(&["-V"]), Ok(Command::Version));
-        assert_eq!(parse(&["--version"]), Ok(Command::Version));
+    fn log_level_flag_wins_over_default_and_env() {
+        assert_eq!(
+            parse(&["--log-level", "debug", "notes.md"])
+                .unwrap()
+                .log_level,
+            LevelFilter::Debug
+        );
     }
 
     #[test]
-    fn help_after_file_still_wins() {
-        assert_eq!(parse(&["notes.md", "--help"]), Ok(Command::Help));
+    fn bad_log_level_is_an_error() {
+        assert!(parse(&["--log-level", "loud", "notes.md"]).is_err());
     }
 
     #[test]
     fn unknown_option_is_an_error() {
-        assert_eq!(
-            parse(&["--bogus", "notes.md"]),
-            Err("unknown option: --bogus".to_string())
-        );
+        assert!(parse(&["--bogus", "notes.md"]).is_err());
     }
 
     #[test]
     fn no_file_is_an_error() {
-        assert_eq!(parse(&[]), Err("no file given".to_string()));
+        assert!(parse(&[]).is_err());
     }
 
     #[test]
     fn two_files_is_an_error() {
-        assert_eq!(
-            parse(&["a.md", "b.md"]),
-            Err("expected one file, got 2".to_string())
-        );
+        assert!(parse(&["a.md", "b.md"]).is_err());
     }
 
+    /// `--` ends option parsing, so a file whose name starts with a dash opens.
     #[test]
     fn double_dash_ends_options() {
-        assert_eq!(parse(&["--", "-notes.md"]), run_cmd("-notes.md"));
-        assert_eq!(parse(&["--", "--help"]), run_cmd("--help"));
+        assert_eq!(
+            parse(&["--", "-notes.md"]).unwrap().md_file,
+            PathBuf::from("-notes.md")
+        );
     }
 }

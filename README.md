@@ -132,9 +132,9 @@ Built as a learning ladder — each milestone runs on its own:
 - Link URLs aren't shown — just the underlined link text, as in a browser.
 - Logs go to `$XDG_STATE_HOME/lazymd/lazymd.log` (usually
   `~/.local/state/lazymd/lazymd.log`; `%LOCALAPPDATA%\lazymd\lazymd.log` on
-  Windows), overwritten on each launch. Set `LAZYMD_LOG` to `off`, `error`,
-  `warn`, `info` (the default), `debug`, or `trace` to change how much is
-  written.
+  Windows), overwritten on each launch. Pass `--log-level` (or set `LAZYMD_LOG`)
+  to `off`, `error`, `warn`, `info` (the default), `debug`, or `trace` to change
+  how much is written.
 
 ## License
 
