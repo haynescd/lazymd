@@ -13,7 +13,7 @@ categories = ["command-line-utilities", "text-processing"]
 
 [dependencies]
 anyhow = "1.0.104"
-comrak = { version = "0.54.0", default-features = false }
+comrak = { version = "0.55.0", default-features = false }
 crossterm = "0.29.0"
 log = "0.4.34"
 notify = "8.2.0"
