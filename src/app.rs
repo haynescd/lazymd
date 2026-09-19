@@ -1,11 +1,17 @@
 use std::{
+    collections::HashMap,
     path::Path,
     time::{Duration, Instant},
 };
 
-use ratatui::text::Line;
+use ratatui::{style::Style, text::Line};
+use ratatui_image::{picker::Picker, sliced::SlicedProtocol};
 
-use crate::render::render_ast;
+use crate::render::{
+    RenderElement,
+    image::{Image, ImageDescriptor, ImageLoader, ImageResolver},
+    inline, render_ast,
+};
 
 /// How long a status-line message stays up.
 const MESSAGE_TTL: Duration = Duration::from_secs(3);
@@ -18,14 +24,36 @@ pub struct Message {
     shown_at: Instant,
 }
 
+/// An image and the row of `App::lines` it starts on. The rows it covers are
+/// blank in `lines`; the UI draws the image over them.
 #[derive(Debug)]
+pub struct PlacedImage {
+    pub row: usize,
+    pub height: usize,
+    pub image: ImageDescriptor,
+}
+
 pub struct App {
     pub should_quit: bool,
     pub md_filepath: String,
     /// The Markdown source, kept so it can be re-rendered when the width changes.
     source: String,
-    /// `source` rendered at `render_width` columns.
+    /// Every row of the document, one per terminal row. An image's rows are
+    /// blank placeholders, so scrolling treats them like any other line.
     pub lines: Vec<Line<'static>>,
+    /// The images to draw over their placeholder rows, in document order.
+    pub images: Vec<PlacedImage>,
+    /// `None` shows images as their alt text (tests, or a terminal we couldn't
+    /// query). The two are set together: there's no point resolving an image we
+    /// have no way to draw.
+    image_resolver: Option<ImageResolver>,
+    image_loader: Option<ImageLoader>,
+    /// Decoded images, keyed by file *and* width: a resize needs a new size, so
+    /// it needs a new entry. `None` remembers one that wouldn't decode, so we
+    /// don't try it again on every rebuild. Rebuilding drops whatever the new
+    /// document and width no longer use.
+    image_cache: HashMap<ImageDescriptor, Option<Image>>,
+
     /// Index of the first visible line.
     pub scroll: usize,
     pub viewport_height: usize,
@@ -35,12 +63,24 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(md_filepath: String, source: String) -> Self {
+    pub fn new(md_filepath: String, source: String, picker: Option<Picker>) -> Self {
+        let (image_resolver, image_loader) = picker
+            .map(|p| {
+                (
+                    ImageResolver::new(Path::new(&md_filepath)),
+                    ImageLoader::new(p),
+                )
+            })
+            .unzip();
         App {
             should_quit: false,
             md_filepath,
             source,
             lines: Vec::new(),
+            images: Vec::new(),
+            image_resolver,
+            image_loader,
+            image_cache: HashMap::new(),
             scroll: 0,
             viewport_height: 0,
             render_width: None,
@@ -76,17 +116,62 @@ impl App {
     pub fn set_viewport(&mut self, width: usize, height: usize) {
         if self.render_width != Some(width) {
             self.render_width = Some(width);
-            self.lines = render_ast(&self.source, width);
+            self.rebuild();
         }
         self.viewport_height = height;
         self.clamp_scroll();
     }
 
+    /// Re-renders the source at the current width.
+    fn rebuild(&mut self) {
+        let width = self.render_width.unwrap_or(80);
+        let elements = render_ast(&self.source, width, self.image_resolver.as_ref());
+
+        self.lines.clear();
+        self.images.clear();
+        // Entries move over from the old cache as they're used, so what the new
+        // document and width don't need is dropped with `old` at the end.
+        let mut old = std::mem::take(&mut self.image_cache);
+        for element in elements {
+            match element {
+                RenderElement::Lines(lines) => self.lines.extend(lines),
+                RenderElement::Image(id) => {
+                    let image = self.image_cache.entry(id.clone()).or_insert_with(|| {
+                        old.remove(&id).unwrap_or_else(|| {
+                            self.image_loader
+                                .as_ref()
+                                .and_then(|l| l.load(id.key.clone(), id.width))
+                        })
+                    });
+
+                    // Resolved but wouldn't decode: show the alt text rather
+                    // than dropping the image from the document entirely.
+                    let Some(image) = image else {
+                        self.lines
+                            .push(Line::from(inline::image_label(&id.alt, Style::default())));
+                        continue;
+                    };
+
+                    let row = self.lines.len();
+                    let height = usize::from(image.height);
+                    self.lines
+                        .extend(std::iter::repeat_n(Line::default(), height));
+                    self.images.push(PlacedImage {
+                        row,
+                        height,
+                        image: id,
+                    });
+                }
+            }
+        }
+        log::trace!("{} images cached after rebuild", self.image_cache.len());
+    }
+
     /// Swaps in new Markdown source, keeping the scroll position where possible.
     pub fn reload(&mut self, source: String) {
         self.source = source;
-        if let Some(width) = self.render_width {
-            self.lines = render_ast(&self.source, width);
+        if self.render_width.is_some() {
+            self.rebuild();
         }
         self.clamp_scroll();
         self.notify("reloaded", false);
@@ -110,6 +195,21 @@ impl App {
     pub fn visible_lines(&self) -> &[Line<'static>] {
         let end = (self.scroll + self.viewport_height).min(self.lines.len());
         &self.lines[self.scroll.min(end)..end]
+    }
+
+    /// The images at least partly on screen, each with the viewport row it
+    /// starts on — negative when its top has scrolled off.
+    pub fn visible_images(&self) -> impl Iterator<Item = (&SlicedProtocol, i16)> {
+        let (top, bottom) = (self.scroll, self.scroll + self.viewport_height);
+        let cache = &self.image_cache;
+        self.images
+            .iter()
+            .filter(move |p| p.row < bottom && p.row + p.height > top)
+            .filter_map(move |p| {
+                let image = cache.get(&p.image)?.as_ref()?; // skip on miss
+                // In range, so the offset is within ± one image or viewport height.
+                Some((&image.protocol, (p.row as i64 - top as i64) as i16))
+            })
     }
 
     pub fn scroll_down(&mut self, n: usize) {
@@ -159,9 +259,48 @@ mod tests {
         let source = (0..100)
             .map(|i| format!("line {i}\n\n"))
             .collect::<String>();
-        let mut app = App::new("dir/notes.md".into(), source);
+        let mut app = App::new("dir/notes.md".into(), source, None);
         app.set_viewport(40, 10);
         app
+    }
+
+    /// A scratch directory for one test, deleted when dropped — even if the
+    /// test panics.
+    struct TestDir(std::path::PathBuf);
+
+    impl TestDir {
+        fn new() -> Self {
+            // Tests run in parallel, so each call gets its own directory.
+            static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let call = CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let dir =
+                std::env::temp_dir().join(format!("lazymd-test-{}-{call}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            TestDir(dir)
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// An app whose document is one line, an image `rows` terminal rows tall
+    /// (at halfblocks' 10x20 cells), and 30 more lines. Keep the `TestDir`
+    /// alive for as long as the app might reload the image.
+    fn app_with_image(rows: u32) -> (App, TestDir) {
+        let dir = TestDir::new();
+        image::RgbImage::new(10, rows * 20)
+            .save(dir.0.join("pic.png"))
+            .unwrap();
+
+        let tail: String = (0..30).map(|i| format!("\n\nline {i}")).collect();
+        let source = format!("top\n\n![pic](pic.png){tail}");
+        let md_path = dir.0.join("doc.md").to_string_lossy().into_owned();
+        let mut app = App::new(md_path, source, Some(Picker::halfblocks()));
+        app.set_viewport(40, 10);
+        (app, dir)
     }
 
     #[test]
@@ -215,5 +354,56 @@ mod tests {
     #[test]
     fn file_name_strips_directories() {
         assert_eq!(app().file_name(), "notes.md");
+    }
+
+    #[test]
+    fn plain_text_has_no_images() {
+        assert!(app().images.is_empty());
+    }
+
+    /// An image takes blank placeholder rows, so scrolling counts it like text.
+    #[test]
+    fn image_reserves_its_rows() {
+        let (app, _dir) = app_with_image(4);
+        assert_eq!(app.images.len(), 1);
+        // "top", a blank separator, then the image.
+        assert_eq!(app.images[0].row, 2);
+        assert_eq!(app.images[0].height, 4);
+        assert!(app.lines[2..6].iter().all(|l| l.width() == 0));
+        // Then 30 lines, each after a blank separator.
+        assert_eq!(app.lines.len(), 6 + 60);
+    }
+
+    /// A narrower viewport scales the image down, so the cached copy — sized
+    /// for the old width — must not be reused.
+    #[test]
+    fn resizing_re_sizes_the_image() {
+        let dir = TestDir::new();
+        // 40 cells wide at halfblocks' 10x20, so it has room to shrink.
+        image::RgbImage::new(400, 800)
+            .save(dir.0.join("pic.png"))
+            .unwrap();
+        let md_path = dir.0.join("doc.md").to_string_lossy().into_owned();
+        let mut app = App::new(md_path, "![pic](pic.png)".into(), Some(Picker::halfblocks()));
+
+        app.set_viewport(40, 10);
+        assert_eq!(app.images[0].height, 40);
+
+        app.set_viewport(20, 10);
+        assert_eq!(app.images[0].height, 20);
+        // The 40-column entry is dropped rather than kept forever.
+        assert_eq!(app.image_cache.len(), 1);
+    }
+
+    #[test]
+    fn visible_images_track_the_scroll() {
+        let (mut app, _dir) = app_with_image(4);
+        let offsets = |app: &App| app.visible_images().map(|(_, y)| y).collect::<Vec<_>>();
+        assert_eq!(offsets(&app), [2]);
+        app.scroll_down(3);
+        // Top row scrolled off: the image starts above the viewport.
+        assert_eq!(offsets(&app), [-1]);
+        app.scroll_down(3);
+        assert!(offsets(&app).is_empty());
     }
 }

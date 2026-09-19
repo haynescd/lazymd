@@ -5,6 +5,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, BorderType, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
 };
+use ratatui_image::sliced::SlicedImage;
 
 use unicode_width::UnicodeWidthStr;
 
@@ -44,6 +45,13 @@ pub fn ui(app: &mut App, frame: &mut Frame) {
 
     frame.render_widget(block, main);
     frame.render_widget(Paragraph::new(app.visible_lines().to_vec()), content);
+
+    // Images go over the blank rows reserved for them. One whose top has
+    // scrolled off gets a negative offset, and `SlicedImage` draws only the
+    // rows still on screen.
+    for (protocol, y) in app.visible_images() {
+        frame.render_widget(SlicedImage::new(protocol, (0, y).into()), content);
+    }
 
     if app.max_scroll() > 0 {
         // content_length counts scroll *positions*, so the thumb reaches the

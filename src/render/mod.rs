@@ -30,8 +30,11 @@ use ratatui::{
 
 use crate::theme;
 
+use image::ImageResolver;
+
 mod highlight;
-mod inline;
+pub mod image;
+pub(crate) mod inline;
 mod table;
 mod wrap;
 
@@ -173,12 +176,22 @@ impl ListMarker {
     }
 }
 
+/// A rendered element: text lines or an image.
+#[derive(Debug)]
+pub enum RenderElement {
+    /// A run of text rows.
+    Lines(Vec<Line<'static>>),
+    /// An image with its protocol and terminal height.
+    Image(image::ImageDescriptor),
+}
+
 /// The rendered document, and everything needed to place one more line in it.
 #[derive(Debug)]
 struct Canvas {
     /// Total width available, in columns.
     width: usize,
-    lines: Vec<Line<'static>>,
+    /// Text rows and images, in document order.
+    elements: Vec<RenderElement>,
     /// One entry per container we're currently inside, outermost first.
     prefixes: Vec<Prefix>,
     /// Whether the next block needs a blank line before it: true after content,
@@ -190,7 +203,7 @@ impl Canvas {
     fn new(width: usize) -> Self {
         Canvas {
             width,
-            lines: Vec::new(),
+            elements: Vec::new(),
             prefixes: Vec::new(),
             needs_separator: false,
         }
@@ -226,8 +239,16 @@ impl Canvas {
             spans.extend(p.for_next_line().iter().cloned());
         }
         spans.extend(content);
-        self.lines.push(Line::from(spans));
+        self.push_row(Line::from(spans));
         self.needs_separator = true;
+    }
+
+    /// Adds a row to the trailing run of text, starting a new run after an image.
+    fn push_row(&mut self, line: Line<'static>) {
+        match self.elements.last_mut() {
+            Some(RenderElement::Lines(lines)) => lines.push(line),
+            _ => self.elements.push(RenderElement::Lines(vec![line])),
+        }
     }
 
     /// Emits a line the next block follows directly, with no separator.
@@ -244,7 +265,7 @@ impl Canvas {
             .iter()
             .flat_map(|p| p.rest.iter().cloned())
             .collect();
-        self.lines.push(Line::from(spans));
+        self.push_row(Line::from(spans));
         self.needs_separator = false;
     }
 
@@ -267,9 +288,16 @@ impl Canvas {
         self.push_line(vec![Span::styled(glyph.repeat(width), style)]);
     }
 
-    /// The finished document.
-    fn into_lines(self) -> Vec<Line<'static>> {
-        self.lines
+    /// The finished document elements.
+    fn into_elements(self) -> Vec<RenderElement> {
+        self.elements
+    }
+
+    /// Emits an image. It sits outside the prefix system — the image renders
+    /// into its own area, not behind any container prefix.
+    fn push_image(&mut self, img: image::ImageDescriptor) {
+        self.elements.push(RenderElement::Image(img));
+        self.needs_separator = true;
     }
 }
 
@@ -291,17 +319,22 @@ struct Ctx {
 }
 
 #[derive(Debug)]
-struct Renderer {
+struct Renderer<'img> {
     canvas: Canvas,
     /// Footnote definitions share one divider, drawn before the first of them.
     footnotes_started: bool,
+    /// Without a resolver, images show as their alt text.
+    images: Option<&'img ImageResolver>,
 }
 
-impl Renderer {
-    fn new(width: usize) -> Self {
+// The lifetime is `'img`, not `'a`: the block methods below each bind their own
+// `'a` to the AST arena, which a struct lifetime of that name would shadow.
+impl<'img> Renderer<'img> {
+    fn new(width: usize, images: Option<&'img ImageResolver>) -> Self {
         Renderer {
             canvas: Canvas::new(width),
             footnotes_started: false,
+            images,
         }
     }
 
@@ -329,11 +362,14 @@ impl Renderer {
         match &data.value {
             NodeValue::Document => self.blocks(n, ctx),
             NodeValue::Heading(h) => self.heading(n, h.level, ctx),
-            NodeValue::Paragraph => {
-                self.separate(ctx);
-                let spans = inline::inlines(n, ctx.base_style);
-                self.canvas.push_wrapped(spans);
-            }
+            NodeValue::Paragraph => match sole_image(n) {
+                Some((url, alt)) => self.image(&url, &alt, ctx),
+                None => {
+                    self.separate(ctx);
+                    let spans = inline::inlines(n, ctx.base_style);
+                    self.canvas.push_wrapped(spans);
+                }
+            },
             NodeValue::List(nl) => self.list(n, *nl, ctx),
             // Items are handled by `list`; these only appear if one is orphaned.
             NodeValue::Item(_) | NodeValue::TaskItem(_) => self.blocks(n, ctx),
@@ -527,6 +563,34 @@ impl Renderer {
             }
         }
     }
+
+    /// An image on its own line: drawn if it loads, else its alt text.
+    fn image(&mut self, url: &str, alt: &str, ctx: Ctx) {
+        self.separate(ctx);
+        let width = self.canvas.content_width();
+        match self.images.and_then(|r| r.resolve(url, width, alt)) {
+            Some(image) => self.canvas.push_image(image),
+            None => {
+                log::warn!("couldn't load image {url:?}");
+                self.canvas
+                    .push_line(vec![inline::image_label(alt, ctx.base_style)]);
+            }
+        }
+    }
+}
+
+/// A paragraph that is nothing but one image, as its url and alt text. Only
+/// these become pictures: an image in a run of text stays as its alt text,
+/// since a picture several rows tall can't sit inside a wrapped line.
+fn sole_image<'a>(n: &'a AstNode<'a>) -> Option<(String, String)> {
+    let child = n.first_child()?;
+    if child.next_sibling().is_some() {
+        return None;
+    }
+    match &child.data.borrow().value {
+        NodeValue::Image(link) => Some((link.url.clone(), inline::alt_text(child))),
+        _ => None,
+    }
 }
 
 /// The language from a fence's info string, which may carry more after it:
@@ -553,21 +617,38 @@ static OPTIONS: LazyLock<Options<'static>> = LazyLock::new(|| Options {
     ..Default::default()
 });
 
-/// Parses `md` and renders it to lines that fit in `width` columns.
-pub fn render_ast(md: &str, width: usize) -> Vec<Line<'static>> {
+/// Parses `md` and renders it to elements (text lines + images) that fit in
+/// `width` columns. Without a resolver, images show as their alt text.
+pub fn render_ast(md: &str, width: usize, images: Option<&ImageResolver>) -> Vec<RenderElement> {
     let arena = Arena::new();
     let root = parse_document(&arena, md, &OPTIONS);
 
-    let mut renderer = Renderer::new(width);
+    let mut renderer = Renderer::new(width, images);
     renderer.block(root, Ctx::default());
 
-    renderer.canvas.into_lines()
+    renderer.canvas.into_elements()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use ratatui::style::Color;
+
+    /// The text rows of `md` rendered at `width`, with no image loader.
+    fn render_lines(md: &str, width: usize) -> Vec<Line<'static>> {
+        text_lines(render_ast(md, width, None))
+    }
+
+    /// Every text row, in order; images are skipped.
+    fn text_lines(elements: Vec<RenderElement>) -> Vec<Line<'static>> {
+        elements
+            .into_iter()
+            .flat_map(|e| match e {
+                RenderElement::Lines(lines) => lines,
+                RenderElement::Image(_) => Vec::new(),
+            })
+            .collect()
+    }
 
     fn plain(lines: &[Line]) -> Vec<String> {
         lines
@@ -584,7 +665,7 @@ mod tests {
     }
 
     fn render(md: &str) -> Vec<String> {
-        plain(&render_ast(md, 40))
+        plain(&render_lines(md, 40))
     }
 
     /// The first span whose text contains `needle`.
@@ -598,7 +679,7 @@ mod tests {
 
     #[test]
     fn heading_drops_hashes_and_is_bold() {
-        let lines = render_ast("## Title", 40);
+        let lines = render_lines("## Title", 40);
         assert_eq!(plain(&lines)[0], "Title");
         let span = span_with(&lines, "Title");
         assert!(span.style.add_modifier.contains(Modifier::BOLD));
@@ -614,7 +695,7 @@ mod tests {
 
     #[test]
     fn emphasis_uses_modifiers_not_syntax() {
-        let lines = render_ast("**bold** *it* ~~gone~~", 40);
+        let lines = render_lines("**bold** *it* ~~gone~~", 40);
         assert_eq!(plain(&lines), ["bold it gone"]);
         assert!(
             span_with(&lines, "bold")
@@ -638,21 +719,21 @@ mod tests {
 
     #[test]
     fn nested_emphasis_combines() {
-        let lines = render_ast("***both***", 40);
+        let lines = render_lines("***both***", 40);
         let m = span_with(&lines, "both").style.add_modifier;
         assert!(m.contains(Modifier::BOLD | Modifier::ITALIC));
     }
 
     #[test]
     fn inline_code_has_background() {
-        let lines = render_ast("run `ls` now", 40);
+        let lines = render_lines("run `ls` now", 40);
         assert_eq!(plain(&lines), ["run ls now"]);
         assert_eq!(span_with(&lines, "ls").style.bg, Some(theme::CODE_BG));
     }
 
     #[test]
     fn link_shows_text_underlined() {
-        let lines = render_ast("[docs](https://example.com)", 40);
+        let lines = render_lines("[docs](https://example.com)", 40);
         assert_eq!(plain(&lines), ["docs"]);
         let style = span_with(&lines, "docs").style;
         assert!(style.add_modifier.contains(Modifier::UNDERLINED));
@@ -666,7 +747,7 @@ mod tests {
 
     #[test]
     fn long_paragraph_wraps() {
-        let out = plain(&render_ast("aaa bbb ccc ddd", 10));
+        let out = plain(&render_lines("aaa bbb ccc ddd", 10));
         assert_eq!(out, ["aaa bbb", "ccc ddd"]);
     }
 
@@ -719,13 +800,13 @@ mod tests {
 
     #[test]
     fn wrapped_list_item_keeps_its_indent() {
-        let out = plain(&render_ast("- aaa bbb ccc", 11));
+        let out = plain(&render_lines("- aaa bbb ccc", 11));
         assert_eq!(out, ["• aaa bbb", "  ccc"]);
     }
 
     #[test]
     fn task_items_use_checkboxes_and_dim_when_done() {
-        let lines = render_ast("- [x] done\n- [ ] todo", 40);
+        let lines = render_lines("- [x] done\n- [ ] todo", 40);
         assert_eq!(plain(&lines), ["✔ done", "☐ todo"]);
         assert_eq!(span_with(&lines, "done").style.fg, Some(Color::DarkGray));
         assert_eq!(span_with(&lines, "todo").style.fg, None);
@@ -743,21 +824,21 @@ mod tests {
     /// A checked item dims only its own text — the next item starts clean.
     #[test]
     fn task_dimming_does_not_leak_to_the_next_item() {
-        let lines = render_ast("- [x] done\n- plain", 40);
+        let lines = render_lines("- [x] done\n- plain", 40);
         assert_eq!(span_with(&lines, "plain").style.fg, None);
     }
 
     /// A quote's grey and its looseness end with the quote.
     #[test]
     fn quote_styling_does_not_leak_to_the_next_block() {
-        let lines = render_ast("- > quoted\n- plain", 40);
+        let lines = render_lines("- > quoted\n- plain", 40);
         assert_eq!(span_with(&lines, "plain").style.fg, None);
         assert_eq!(plain(&lines), ["• ▎ quoted", "• plain"]);
     }
 
     #[test]
     fn blockquote_bar_continues_across_paragraphs_and_wraps() {
-        let out = plain(&render_ast("> aaa bbb ccc\n>\n> ddd", 11));
+        let out = plain(&render_lines("> aaa bbb ccc\n>\n> ddd", 11));
         assert_eq!(out, ["▎ aaa bbb", "▎ ccc", "▎", "▎ ddd"]);
     }
 
@@ -781,7 +862,7 @@ mod tests {
 
     #[test]
     fn code_block_is_a_padded_block_with_a_label() {
-        let lines = render_ast("```rust\nfn main() {}\n```", 30);
+        let lines = render_lines("```rust\nfn main() {}\n```", 30);
         let out = plain(&lines);
         assert_eq!(out[0].trim(), "rust");
         assert_eq!(out[1], " fn main() {}");
@@ -806,11 +887,12 @@ mod tests {
     /// A label too wide for the block is dropped rather than widening one row.
     #[test]
     fn code_block_label_never_widens_the_block() {
-        let lines = render_ast("```averyveryverylonglanguagename\nx\n```", 12);
+        let lines = render_lines("```averyveryverylonglanguagename\nx\n```", 12);
         for line in &lines {
             assert_eq!(line.width(), 12, "{:?}", plain(&lines));
         }
-        assert_eq!(plain(&lines)[0], "");
+        let out = plain(&lines);
+        assert_eq!(out[0], "");
     }
 
     #[test]
@@ -843,7 +925,7 @@ mod tests {
 
     #[test]
     fn table_header_is_bold() {
-        let lines = render_ast("| head |\n|---|\n| body |", 40);
+        let lines = render_lines("| head |\n|---|\n| body |", 40);
         let bold = |t| {
             span_with(&lines, t)
                 .style
@@ -857,7 +939,7 @@ mod tests {
     #[test]
     fn wide_table_shrinks_and_wraps_cells() {
         let md = "| a | b |\n|---|---|\n| one two three four | x |";
-        let lines = render_ast(md, 16);
+        let lines = render_lines(md, 16);
         for line in &lines {
             assert!(line.width() <= 16, "{:?}", plain(&lines));
         }
@@ -870,7 +952,7 @@ mod tests {
     fn table_rows_all_have_the_same_width() {
         let heart = "\u{2764}\u{fe0f}";
         let md = format!("| a | b |\n|---|---|\n| {heart}{heart}{heart} | y |\n| zzzz | w |");
-        let lines = render_ast(&md, 40);
+        let lines = render_lines(&md, 40);
         let first = lines[0].width();
         for line in &lines {
             assert_eq!(line.width(), first, "{:?}", plain(&lines));
@@ -879,7 +961,7 @@ mod tests {
 
     #[test]
     fn html_is_shown_dimmed_but_comments_are_hidden() {
-        let lines = render_ast("<div>hi</div>\n\n<!-- secret -->\n\nafter", 40);
+        let lines = render_lines("<div>hi</div>\n\n<!-- secret -->\n\nafter", 40);
         assert_eq!(plain(&lines), ["<div>hi</div>", "", "after"]);
         assert_eq!(span_with(&lines, "<div>").style.fg, Some(Color::DarkGray));
     }
@@ -907,6 +989,22 @@ mod tests {
         assert_eq!(render("![a cat](cat.png)"), ["[image: a cat]"]);
     }
 
+    /// A resolver that can't find the file falls back to the alt text, not the url.
+    #[test]
+    fn missing_image_falls_back_to_alt_text() {
+        let resolver = ImageResolver::new(std::path::Path::new("no/such/dir/doc.md"));
+        let out = text_lines(render_ast("![a cat](cat.png)", 40, Some(&resolver)));
+        assert_eq!(plain(&out), ["[image: a cat]"]);
+    }
+
+    #[test]
+    fn image_inside_text_stays_inline() {
+        assert_eq!(
+            render("see ![a cat](cat.png) here"),
+            ["see [image: a cat] here"]
+        );
+    }
+
     #[test]
     fn front_matter_is_dimmed_not_parsed_as_markdown() {
         let out = render("---\ntitle: x\n---\n\n# Hi");
@@ -916,6 +1014,6 @@ mod tests {
 
     #[test]
     fn empty_document_renders_nothing() {
-        assert!(render_ast("", 40).is_empty());
+        assert!(render_lines("", 40).is_empty());
     }
 }

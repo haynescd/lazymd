@@ -18,6 +18,24 @@ pub(super) fn inlines<'a>(n: &'a AstNode<'a>, style: Style) -> Vec<Span<'static>
     out
 }
 
+/// An image's alt text: the plain text of its children.
+pub(super) fn alt_text<'a>(n: &'a AstNode<'a>) -> String {
+    inlines(n, Style::default())
+        .iter()
+        .map(|s| s.content.as_ref())
+        .collect()
+}
+
+/// What an image shows when it can't be drawn: its alt text, marked as an image.
+pub(crate) fn image_label(alt: &str, style: Style) -> Span<'static> {
+    let label = if alt.is_empty() {
+        "[image]".to_string()
+    } else {
+        format!("[image: {alt}]")
+    };
+    Span::styled(label, style.patch(theme::image()))
+}
+
 fn inlines_into<'a>(n: &'a AstNode<'a>, style: Style, out: &mut Vec<Span<'static>>) {
     for child in n.children() {
         inline(child, style, out);
@@ -47,18 +65,7 @@ fn inline<'a>(n: &'a AstNode<'a>, style: Style, out: &mut Vec<Span<'static>>) {
         NodeValue::Link(_) | NodeValue::WikiLink(_) => {
             inlines_into(n, style.patch(theme::link()), out)
         }
-        NodeValue::Image(_) => {
-            let alt: String = inlines(n, style)
-                .iter()
-                .map(|s| s.content.as_ref())
-                .collect();
-            let label = if alt.is_empty() {
-                "[image]".to_string()
-            } else {
-                format!("[image: {alt}]")
-            };
-            out.push(Span::styled(label, style.patch(theme::image())));
-        }
+        NodeValue::Image(_) => out.push(image_label(&alt_text(n), style)),
         NodeValue::HtmlInline(html) => {
             let tag = html.trim().to_ascii_lowercase();
             if matches!(tag.as_str(), "<br>" | "<br/>" | "<br />") {

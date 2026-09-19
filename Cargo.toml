@@ -17,7 +17,9 @@ comrak = { version = "0.54.0", default-features = false }
 crossterm = "0.29.0"
 log = "0.4.34"
 notify = "8.2.0"
+image = "0.25"
 ratatui = "0.30.2"
+ratatui-image = { version = "11", default-features = false, features = ["crossterm"] }
 simplelog = "0.12.2"
 syntect = { version = "5.3.0", default-features = false, features = ["default-fancy"] }
 unicode-segmentation = "1.12"
