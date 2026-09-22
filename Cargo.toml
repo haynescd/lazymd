@@ -10,6 +10,9 @@ homepage = "https://github.com/haynescd/lazymd"
 readme = "README.md"
 keywords = ["markdown", "tui", "terminal", "preview", "cli"]
 categories = ["command-line-utilities", "text-processing"]
+# The Neovim plugin and the sample documents ship with the repo, not the crate.
+# Cargo only ever compiles `src/`, so this changes packaging alone.
+exclude = ["lua/", "plugin/", "doc/", "docs/", "test/", ".luarc.json", "stylua.toml"]
 
 [dependencies]
 anyhow = "1.0.104"

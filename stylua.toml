@@ -1,0 +1,4 @@
+# Matches ~/.config/nvim/stylua.toml, so conform formats this plugin's Lua the
+# same way it formats the config that loads it.
+indent_type = "Spaces"
+column_width = 120
