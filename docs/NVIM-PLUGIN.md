@@ -1,9 +1,10 @@
 # Learning Neovim Plugin Development by Building lazymd.nvim
 
 A study guide, in the shape of [LEARNING.md](LEARNING.md). The plugin under
-`plugin/` and `lua/lazymd/` is small on purpose — about 250 lines of Lua that
-open a floating window, run `lazymd` inside it, and clean up. Every Neovim
-concept it touches is below, in the order you need them.
+`plugin/` and `lua/lazymd/` is small on purpose — about 500 lines of Lua, more
+than half of it comments — that opens a floating window, runs `lazymd` inside
+it, relays its images to the real terminal, and cleans up. Every Neovim concept
+it touches is below, in the order you need them.
 
 ## How to use this guide
 
@@ -211,9 +212,9 @@ Two consequences worth knowing:
   that.
 - **`$TERM` becomes `xterm-256color`.** Neovim sets it for the job. Truecolor
   still works, so lazymd's syntax highlighting is fine — but Neovim's built-in
-  terminal implements neither the kitty graphics protocol nor sixel, so lazymd's
-  image support falls back to halfblocks in here. That's the one place the plugin
-  is visibly worse than running lazymd in your real terminal.
+  terminal implements neither the kitty graphics protocol nor sixel, and it
+  doesn't answer lazymd's "what can you draw?" query. Left alone, images fall
+  back to blurry halfblocks. N5 is how the plugin gets them sharp anyway.
 
 **Read:** `:help jobstart()`, `:help terminal-mode`, `:help job-control`.
 
@@ -345,6 +346,117 @@ preview can follow your cursor. Both are in
 
 ---
 
+## N5 — Talking to the host terminal
+
+**Goal:** images in the float are as sharp as lazymd standalone, in Ghostty,
+kitty or WezTerm.
+
+**New concepts:** the host terminal vs. `:terminal`, `TermRequest`,
+`nvim_ui_send`, kitty Unicode placeholders, why relays are allowlists.
+
+There are **two terminals** in play, and keeping them apart is the whole trick:
+
+```
+Ghostty  ◀── Neovim's TUI draws its grid here ──  Neovim
+                                                    │
+                                          :terminal (libvterm)
+                                                    │
+                                                  lazymd
+```
+
+lazymd talks to libvterm, Neovim's built-in terminal emulator. libvterm turns
+lazymd's output into a grid of cells, and Neovim redraws those cells onto
+Ghostty along with everything else on screen. Anything libvterm doesn't
+understand never reaches Ghostty.
+
+**Kitty's Unicode placeholders** are what make images survive that trip anyway.
+ratatui-image draws a kitty image in two parts:
+
+1. **The data**, sent once as an APC escape: `ESC _G i=<id>,a=T,U=1,… ; <base64> ESC \`.
+   `U=1` makes it a *virtual placement*: Ghostty stores the image but draws
+   nothing yet.
+2. **The placeholders**: every cell the image covers gets the character
+   `U+10EEEE`, with combining marks for its row and column, and the image id
+   in its **foreground colour**.
+
+Part 2 is just text in a colour, and libvterm stores it and Neovim redraws it
+like any other text. Ghostty sees placeholder cells arrive and paints the image
+over them, wherever they are. That's why scrolling, float position, and popups
+covering the preview all just work: Neovim is moving text around, and the
+image follows the text.
+
+Part 1 is the problem. libvterm doesn't know kitty's APC and drops it, so
+Ghostty never receives the image the placeholders point at. Neovim 0.12 has
+exactly the two hooks needed to carry it across:
+
+- **`TermRequest`** fires when a `:terminal` child emits an OSC, DCS or APC
+  sequence. `ev.data.sequence` holds it, starting with the introducer
+  (`"\27_G…"`), and `ev.data.terminator` holds the `ESC \` separately.
+- **`nvim_ui_send(bytes)`** writes raw bytes to the terminal Neovim is running
+  in.
+
+So the relay in `init.lua` is a few lines:
+
+```lua
+local function relay_graphics(ev)
+    local seq = ev.data.sequence
+    if seq:sub(1, 3) ~= "\27_G" then
+        return
+    end
+    vim.api.nvim_ui_send(seq .. ev.data.terminator)
+    -- …remember the image id, for cleanup
+end
+```
+
+> **Why the allowlist matters.** It's tempting to forward *everything* a
+> `:terminal` child emits and let Ghostty sort it out. Don't. That hands
+> whatever's running in the preview control of your real terminal: `OSC 52`
+> writes your system clipboard, `OSC 0` retitles the window, and a Markdown
+> file is exactly the kind of untrusted input that could carry either. Forward
+> the one thing you need, by prefix, and drop the rest.
+
+**Cleanup has a new direction too.** Ghostty holds image data until it's told
+to drop it, and it never learns that lazymd exited. So the plugin records each
+relayed `i=` id, and `forget()` sends `ESC _G a=d,d=I,i=<id> ESC \` for each one
+(`d=I`: delete by id *and* free the data).
+
+**Two limits worth knowing:**
+
+- **Cell size.** Standalone, lazymd asks the terminal how big a cell is in
+  pixels (`CSI 16 t`). Inside Neovim it can't: `TermResponse` relays DA1, OSC,
+  DCS and APC replies, but not CSI, and Neovim leaves the `:terminal` pty's
+  pixel size at zero. lazymd guesses 10×20. A wrong guess doesn't blur
+  anything; ratatui-image sizes the image for the guessed grid, and Ghostty
+  draws it pixel-for-pixel at the real one, so it comes out the wrong size in
+  its space (blank margin, or cropped). Set `cell_size` in the plugin options.
+  To find it, run `lazymd` standalone once and look for
+  `images: Kitty, 12x26 px per cell` in the log.
+- **No compression.** ratatui-image only enables zlib when a query says the
+  terminal supports it, and there's no query here. An 800×400 image is about
+  1.7 MB of base64 through Neovim. That's fine for a local terminal, and worth
+  knowing over SSH.
+
+`auto` picks kitty only when all three hold: `nvim_ui_send` exists, a terminal
+UI is attached (`nvim_list_uis()` reports `stdout_tty`), and the environment
+names a kitty-protocol terminal (`TERM_PROGRAM` is `ghostty` or `WezTerm`, or
+`KITTY_WINDOW_ID` is set). Anything else gets halfblocks. They're blurry, but a
+kitty image sent to a terminal that can't draw it is worse: blank cells.
+
+**Read:** `:help TermRequest`, `:help nvim_ui_send()`, `:help TermResponse`,
+and kitty's
+[Unicode placeholders](https://sw.kovidgoyal.net/kitty/graphics-protocol/#unicode-placeholders).
+
+**Checkpoint:** `:Lazymd test/images.md` in Ghostty shows sharp images that
+scroll with `j`/`k`, and `q` leaves nothing behind on screen.
+
+**Hint if stuck:** blank cells where an image should be means the placeholders
+arrived but the data didn't. Check `:autocmd lazymd` lists a `TermRequest`
+handler, and that `:lua= vim.o.termguicolors` is `true`. Without truecolor,
+Neovim rounds the placeholder's foreground to the nearest palette colour, and
+the image id it encodes is lost.
+
+---
+
 ## Reference: the APIs this plugin uses
 
 Everything above, in one table, for when you remember the concept but not the
@@ -369,3 +481,6 @@ name.
 | `vim.fs.dirname` / `vim.fs.joinpath` | Path manipulation |
 | `vim.tbl_deep_extend("force", a, b)` | Merges user options over defaults |
 | `vim.notify` | Messages, routed through whatever notifier you use |
+| `TermRequest` autocmd | A `:terminal` child emitted an OSC, DCS or APC |
+| `nvim_ui_send(bytes)` | Writes raw bytes to the host terminal (0.12+) |
+| `nvim_list_uis()` | Which UIs are attached; `stdout_tty` means a real terminal |

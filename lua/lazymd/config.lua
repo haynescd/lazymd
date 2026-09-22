@@ -13,6 +13,8 @@ local M = {}
 ---@field border string|string[] Any value `nvim_open_win` accepts for `border`.
 ---@field on_unsaved "warn"|"write"|"refuse" What to do about a modified buffer.
 ---@field log_level string|nil Passed through to lazymd as --log-level.
+---@field images "auto"|"kitty"|"halfblocks" How lazymd draws images inside Neovim.
+---@field cell_size string|nil Terminal cell size in pixels, like "12x26". Only used for kitty images.
 local defaults = {
     cmd = nil,
     -- lazygit.nvim uses 0.9 and it reads well: large enough to be the thing
@@ -23,6 +25,15 @@ local defaults = {
     border = "none",
     on_unsaved = "warn",
     log_level = nil,
+    -- "auto" relays sharp kitty-protocol images when the terminal Neovim runs in
+    -- supports them (Ghostty, kitty, WezTerm), and falls back to halfblocks
+    -- everywhere else. See docs/NVIM-PLUGIN.md, N5.
+    images = "auto",
+    -- lazymd can't ask the terminal for this from inside Neovim, and guesses
+    -- 10x20. A wrong guess leaves images sharp but the wrong size in the space
+    -- reserved for them: a blank margin, or cropped. To find yours, run lazymd
+    -- standalone once and read the log: "images: Kitty, 12x26 px per cell".
+    cell_size = nil,
 }
 
 local options = vim.deepcopy(defaults)
